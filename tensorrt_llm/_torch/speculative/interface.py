@@ -15,6 +15,7 @@ class SpeculativeDecodingMode(IntEnum):
     MTP = auto()
     MTP_EAGLE = auto()
     EAGLE3 = auto()
+    NGRAM = auto()
     NONE = auto()
 
     def is_mtp(self):
@@ -26,6 +27,9 @@ class SpeculativeDecodingMode(IntEnum):
     def is_eagle3(self):
         return self == SpeculativeDecodingMode.EAGLE3
 
+    def is_ngram(self):
+        return self == SpeculativeDecodingMode.NGRAM
+
     def is_none(self):
         return self == SpeculativeDecodingMode.NONE
 
@@ -33,7 +37,10 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_mtp()
 
     def support_overlap_scheduler(self):
-        return self.is_mtp()
+        return self.is_mtp() or self.is_ngram()
+
+    def has_spec_decoder(self):
+        return self.is_mtp() or self.is_eagle3()
 
     def extend_ctx(self, attention_backend: AttentionBackend):
         """
@@ -43,8 +50,9 @@ class SpeculativeDecodingMode(IntEnum):
         """
 
         # Fixme: only trtllm attention backend supports eagle3 generation-phase kernels on blackwell.
-        return self.is_eagle3() and not (isinstance(
-            attention_backend, TrtllmAttention) and get_sm_version() == 100)
+        return (self.is_eagle3()
+                and not (isinstance(attention_backend, TrtllmAttention)
+                         and get_sm_version() == 100)) or self.is_ngram()
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":

@@ -1,5 +1,6 @@
 from .eagle3 import Eagle3Sampler, Eagle3SpecMetadata
 from .mtp import MTPHiddenStatesManager, MTPSampler, MTPSpecMetadata
+from .ngram import NGramPoolManager
 
 
 def get_spec_metadata(spec_config,
@@ -22,7 +23,10 @@ def get_spec_metadata(spec_config,
         return None
 
 
-def get_spec_resource_manager(spec_config, model_config, max_num_requests):
+def get_spec_resource_manager(spec_config,
+                              model_config,
+                              max_num_requests,
+                              disable_overlap_scheduler=False):
     if spec_config.spec_dec_mode.is_mtp_eagle():
         if spec_config.use_relaxed_acceptance_for_thinking:
             return MTPHiddenStatesManager(spec_config, model_config.torch_dtype,
@@ -34,6 +38,9 @@ def get_spec_resource_manager(spec_config, model_config, max_num_requests):
         return MTPHiddenStatesManager(spec_config, model_config.torch_dtype,
                                       model_config.hidden_size,
                                       max_num_requests)
+    elif spec_config.spec_dec_mode.is_ngram():
+        return NGramPoolManager(spec_config, max_num_requests,
+                                not disable_overlap_scheduler)
     else:
         return None
 
