@@ -115,7 +115,7 @@ class NGramPoolManager(BaseResourceManager):
             assert num_rejected_tokens >= 0
 
             prefix = request.get_tokens()[0]
-            if new_tokens_device is not None:
+            if new_tokens is not None:
                 pass  # TODO: rewrite here!
 
             # Generate draft tokens, return None or a list

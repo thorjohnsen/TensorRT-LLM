@@ -825,7 +825,7 @@ class PyExecutor:
                 if num_dummy_request > 0:
                     self._merge_dummy_request(num_dummy_request)
 
-                spec_config = self.model_engine.spec_config
+                spec_config = self.model_engine.spec_config if self.is_spec_decode else None
                 if self.draft_model_engine is not None or \
                     (spec_config is not None and spec_config.spec_dec_mode.is_ngram()):
                     self._prepare_draft_requests()
