@@ -11,7 +11,6 @@ class Drafter(ABC):
     def __init__(
         self,
         spec_resource_manager: Optional[BaseResourceManager] = None,
-        **kwargs,
     ):
         self.spec_resource_manager = spec_resource_manager
 
