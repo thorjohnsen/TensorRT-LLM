@@ -19,9 +19,9 @@ from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist
-from ..speculative import get_spec_resource_manager
+from ..speculative import get_spec_drafter, get_spec_resource_manager
 from ._util import (KvCacheCreator, create_py_executor_instance,
-                    instantiate_drafter, instantiate_sampler, is_mla)
+                    instantiate_sampler, is_mla)
 from .config import PyTorchConfig
 from .config_utils import is_mla
 from .model_engine import PyTorchModelEngine
@@ -266,7 +266,6 @@ def create_py_executor(
 
     executor_config.max_seq_len = max_seq_len
     executor_config.max_num_tokens = model_engine.max_num_tokens
-    spec_config = model_engine.spec_config
 
     if executor_config.enable_chunked_context:
         chunk_unit_size = executor_config.tokens_per_block
@@ -310,8 +309,6 @@ def create_py_executor(
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.SAMPLER):
         sampler = instantiate_sampler(model_engine, executor_config,
                                       pytorch_backend_config, mapping)
-    with mem_monitor.observe_creation_stage(_ExecutorCreationStage.DRAFTER):
-        drafter = instantiate_drafter(model_engine)
 
     resources = {}
     estimating_kv_cache = False
@@ -329,15 +326,16 @@ def create_py_executor(
                 if estimating_kv_cache else _ExecutorCreationStage.KV_CACHE):
             kv_cache_creator.build_managers(resources)
 
-    # resource managers for speculative decoding
-    if spec_config is not None:
-        spec_resource_manager = get_spec_resource_manager(
-            spec_config, model_engine, draft_model_engine)
-        if spec_resource_manager is not None:
-            resources[ResourceManagerType.
-                      SPEC_RESOURCE_MANAGER] = spec_resource_manager
-        if spec_config.spec_dec_mode.is_ngram():
-            drafter.pool_manager = spec_resource_manager
+    # Resource managers for speculative decoding
+    spec_resource_manager = get_spec_resource_manager(model_engine,
+                                                      draft_model_engine)
+    if spec_resource_manager is not None:
+        resources[
+            ResourceManagerType.SPEC_RESOURCE_MANAGER] = spec_resource_manager
+
+    # Drafter for speculative decoding
+    with mem_monitor.observe_creation_stage(_ExecutorCreationStage.DRAFTER):
+        drafter = get_spec_drafter(model_engine, spec_resource_manager)
 
     with mem_monitor.observe_creation_stage(
             _ExecutorCreationStage.INIT_EXTRA_RESOURCES

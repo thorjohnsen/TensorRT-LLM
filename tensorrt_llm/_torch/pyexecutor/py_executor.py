@@ -534,7 +534,7 @@ class PyExecutor:
         stats.static_batching_stats = StaticBatchingStats()
         spec_resource_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
-        if spec_resource_manager is not None or self.drafter is not None:
+        if spec_resource_manager is not None:
             stats.specdec_stats = SpecDecodingStats()
         return stats
 

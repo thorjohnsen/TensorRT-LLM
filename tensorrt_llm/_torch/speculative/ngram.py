@@ -87,8 +87,7 @@ class NGramPoolManager(BaseResourceManager):
             It maps from request ID to the index of the prompt to update the pool in the next step.
     """
 
-    def __init__(self, spec_config, max_num_requests):
-        self.max_num_draft_tokens = spec_config.max_draft_tokens
+    def __init__(self, spec_config: SpecConfig, max_num_requests: int):
         self.prompt_lookup_num_tokens = spec_config.prompt_lookup_num_tokens
         self.max_matching_ngram_size = spec_config.max_matching_ngram_size
         self.is_keep_all = spec_config.is_keep_all
@@ -108,10 +107,11 @@ class NGramPoolManager(BaseResourceManager):
         pass
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
-        if self.is_public_pool:  # TODO: need an updating strategy to swap out the out-of-date pairs
+        if self.is_public_pool:
+            # TODO: Here should be an strategy to update the pool in public pool mode.
             return
 
-        # Swap out the out-of-date pairs if the request is completed.
+        # Remove the pairs if the request is completed in private pool mode.
         for request in chain(scheduled_batch.context_requests,
                              scheduled_batch.generation_requests):
             if request.state == LlmRequestState.GENERATION_COMPLETE:
@@ -119,7 +119,6 @@ class NGramPoolManager(BaseResourceManager):
                 if request_id in self.pool:
                     self.pool.pop(request_id)
                     self.start_index.pop(request_id)
-        return
 
     def get_draft_tokens(
         self,
@@ -130,13 +129,13 @@ class NGramPoolManager(BaseResourceManager):
     ):
         prefix_len = len(prefix)
         max_draft_token_length_this_step = max_sequence_length - 1 - prefix_len
-        if max_draft_token_length_this_step <= 0:  # No draft tokens is need if the prefix is long enough
+        if max_draft_token_length_this_step <= 0:  # No draft token is need if the prefix is long enough
             return [end_id]
-
-        if request_id not in self.start_index:  # A new request
+        if request_id not in self.start_index:  # Extend start_index and pool for a new request
             self.start_index[request_id] = 0
             if not self.is_public_pool:
                 self.pool[request_id] = {}
+
         pool = (self.pool if self.is_public_pool else self.pool[request_id])
 
         # Update pool
@@ -203,12 +202,13 @@ class NGramDrafter(Drafter):
 
     def __init__(
         self,
-        max_seq_len: int,
         spec_config: SpecConfig,
+        ngram_pool_manager: NGramPoolManager = None,
     ):
+        assert ngram_pool_manager is not None, "NGram needs a resource manager to maintain the pool."
+        super().__init__(spec_resource_manager=ngram_pool_manager)
         self.max_seq_len = max_seq_len
         self.max_num_draft_tokens = spec_config.max_draft_tokens
-        self.pool_manager = None
 
     def prepare_draft_tokens(
         self,
@@ -216,7 +216,7 @@ class NGramDrafter(Drafter):
         state: SampleState,
     ) -> None:
 
-        if state is None:  # Skip in the first step (context phase)
+        if state is None:  # Skip the first step
             return
 
         for request in sorted(scheduled_requests.generation_requests,
@@ -225,7 +225,7 @@ class NGramDrafter(Drafter):
             prefix = list(request.get_tokens()[0])  # Get a copy
 
             # Generate draft tokens
-            draft_tokens = self.pool_manager.get_draft_tokens(
+            draft_tokens = self.spec_resource_manager.get_draft_tokens(
                 prefix,
                 request.request_id,
                 request.py_end_id,
@@ -236,5 +236,3 @@ class NGramDrafter(Drafter):
                 pad_length = self.max_num_draft_tokens - len(draft_tokens)
                 draft_tokens.extend([request.py_end_id] * pad_length)
             request.py_draft_tokens = draft_tokens
-
-        return

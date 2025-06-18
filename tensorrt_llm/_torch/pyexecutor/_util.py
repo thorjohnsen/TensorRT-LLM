@@ -17,7 +17,7 @@ from tensorrt_llm.lora_manager import (LoraConfig,
 from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
-from ..speculative import get_spec_decoder, get_spec_drafter
+from ..speculative import get_spec_decoder
 from .config_utils import is_mla, is_nemotron_hybrid
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
@@ -544,15 +544,6 @@ def instantiate_sampler(model_engine: PyTorchModelEngine,
 
     return TorchSampler(max_seq_len=model_engine.max_seq_len,
                         mixed_sampler=pytorch_backend_config.mixed_sampler)
-
-
-def instantiate_drafter(model_engine: PyTorchModelEngine):
-    spec_config = model_engine.spec_config
-    if spec_config is not None and spec_config.spec_dec_mode.has_spec_drafter():
-        return get_spec_drafter(max_seq_len=model_engine.max_seq_len,
-                                spec_config=model_engine.spec_config)
-
-    return None
 
 
 def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:

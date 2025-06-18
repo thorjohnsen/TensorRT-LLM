@@ -56,9 +56,10 @@ def get_spec_metadata(spec_config,
     return None
 
 
-def get_spec_resource_manager(spec_config,
-                              model_engine,
-                              draft_model_engine=None):
+def get_spec_resource_manager(model_engine, draft_model_engine=None):
+    spec_config = model_engine.spec_config
+    if spec_config is None:
+        return None
     model_config = model_engine.model.config
     max_num_requests = model_engine.batch_size
     max_seq_len = model_engine.max_seq_len
@@ -97,9 +98,12 @@ def get_spec_decoder(max_seq_len, spec_config):
     return None
 
 
-def get_spec_drafter(max_seq_len, spec_config):
+def get_spec_drafter(model_engine, spec_resource_manager=None):
+    spec_config = model_engine.spec_config
+    if spec_config is None:
+        return None
     if spec_config.spec_dec_mode.is_ngram():
-        return NGramDrafter(max_seq_len, spec_config)
+        return NGramDrafter(spec_config, spec_resource_manager)
     return None
 
 
