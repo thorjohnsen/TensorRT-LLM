@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Optional
 
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import SampleState
