@@ -21,17 +21,17 @@ from utils.llm_data import llm_models_root
 def test_llama_ngram(disable_overlap_scheduler: bool, use_cuda_graph: bool,
                      attn_backend: str):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 15:
+    if total_mem_gb < 20:
         pytest.skip("Not enough memory to load target model")
 
     llm_common_config = dict( \
-        model=llm_models_root() / "llama-models" / "llama-7b-hf",
+        model=llm_models_root() / "llama-3.1-model" /"Meta-Llama-3.1-8B",
         backend='pytorch',
         attn_backend=attn_backend,
         disable_overlap_scheduler=disable_overlap_scheduler,
         use_cuda_graph=use_cuda_graph,
         max_batch_size=4,
-        kv_cache_config=KvCacheConfig(enable_block_reuse=True),
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
         max_num_tokens=2048,
     )
 
@@ -40,7 +40,7 @@ def test_llama_ngram(disable_overlap_scheduler: bool, use_cuda_graph: bool,
         max_matching_ngram_size=2,
         is_keep_all=True,
         is_use_oldest=True,
-        is_public_pool=False,
+        is_public_pool=True,
     )
 
     prompts = [
