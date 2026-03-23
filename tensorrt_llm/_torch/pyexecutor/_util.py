@@ -292,6 +292,14 @@ class KvCacheCreator:
             num_cache_blocks += (num_req_tokens + self._tokens_per_block -
                                  1) // self._tokens_per_block
 
+        # With ADP enabled, _create_dummy_context_requests produces tp_size
+        # copies so each rank gets work during the estimation warmup. But the
+        # scheduler distributes them evenly (1 per rank), so each rank's KV
+        # cache only needs capacity for its own share, not all of them.
+        if self._mapping.enable_attention_dp and self._mapping.tp_size > 1:
+            num_cache_blocks = (num_cache_blocks + self._mapping.tp_size -
+                                1) // self._mapping.tp_size
+
         # Max cuda graph warmup required tokens
         max_cuda_graph_bs = min(self._model_engine.batch_size,
                                 self._model_engine._max_cuda_graph_batch_size)
