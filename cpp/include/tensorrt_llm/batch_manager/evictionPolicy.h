@@ -124,8 +124,10 @@ private:
     // Queues of available leaf blocks, split by level and priority: [level][priorityIdx]
     // Levels 0,1 = primary,secondary (real cache); level 2 = placeholder
     std::vector<std::vector<FreeBlocksQueue>> mFreeQueues;
-    // Iterators to block entries in mFreeQueues, indexed by block ID. Holds ALL arguments needed to remove block from free queue
-    BidirectionalVector<std::optional<std::tuple<SizeType32, SizeType32, FreeBlocksQueue::iterator>>> mFreeBlockIterators;
+    // Iterators to block entries in mFreeQueues, indexed by block ID. Holds ALL arguments needed to remove block from
+    // free queue
+    BidirectionalVector<std::optional<std::tuple<SizeType32, SizeType32, FreeBlocksQueue::iterator>>>
+        mFreeBlockIterators;
     // Amount of free blocks at each level
     std::vector<SizeType32> mNumFreeBlocksPerLevel;
     // Secondary offload threshold. Blocks below this priority won't be offloaded.
