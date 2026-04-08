@@ -4,6 +4,16 @@
 
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
+## TensorRT-LLM Release 1.2.1
+
+### Highlights
+
+- **Fixed Issue**
+  - Fixed an issue that caused KV cache corruption (#12770)
+
+- **Infrastructure Changes**
+  - Upgraded xgrammar and flashinfer (#12811)
+
 ## TensorRT-LLM Release 1.2
 
 ### Highlights
