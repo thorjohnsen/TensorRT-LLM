@@ -97,7 +97,8 @@ void LRUEvictionPolicy::initializePlaceholders(std::vector<BlockPtr>& allPlaceho
     {
         if (block)
         {
-            mFreeBlockIterators[block->getBlockId()] = freeQueue.insert(freeQueue.end(), block);
+            mFreeBlockIterators[block->getBlockId()] = std::make_tuple(
+                kPlaceholderLevel, defaultPriorityIdx, freeQueue.insert(freeQueue.end(), block));
             mNumFreeBlocksPerLevel[kPlaceholderLevel]++;
         }
     }
