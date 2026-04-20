@@ -1022,7 +1022,7 @@ class Indexer(nn.Module):
         - Prepares schedule_metadata for fp8_paged_mqa_logits
         - Stores generation request IDs for decode phase
         """
-        kv_cache_manager = metadata.kv_cache_manager
+        metadata.kv_cache_manager
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
