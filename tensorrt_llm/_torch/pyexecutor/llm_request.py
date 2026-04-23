@@ -1,11 +1,12 @@
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
 
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.sampling_params import LogprobMode
@@ -38,6 +39,9 @@ REQUEST_TYPE_MAPPING = {
     tllm_executor.RequestType.REQUEST_TYPE_GENERATION_ONLY:
     LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
 }
+
+if TYPE_CHECKING:
+    from .sampling_utils import Strategy
 
 
 @dataclass(slots=True)
@@ -83,7 +87,7 @@ class LogitsStorage:
         self.use_device_memory = use_device_memory
         self.use_chunked_generation_logits = use_chunked_generation_logits
         self.chunk_size = chunk_size
-        self._logits_indices = []
+        self._logits_indices: list[tuple[int, int]] = []
 
         # Lazily initialized by _init() upon first append()
         self._storage: torch.Tensor | None = None
@@ -109,7 +113,7 @@ class LogitsStorage:
                 (self.seq_length, self.beam_width, self.vocab_size),
                 dtype=logits.dtype,
                 device='cpu',
-                pin_memory=True,
+                pin_memory=prefer_pinned(),
                 requires_grad=False)
 
     def _init_chunked_storage(self, logits: torch.Tensor):
@@ -120,7 +124,7 @@ class LogitsStorage:
             (self.seq_length, self.beam_width, self.vocab_size),
             dtype=logits.dtype,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
             requires_grad=False)
 
     def append(self, logits: torch.Tensor):
@@ -233,6 +237,8 @@ class LogProbStorage:
             if cum_log_probs is not None:
                 self.cum_log_probs[beam_idx] = cum_log_probs[beam_idx]
             else:
+                # FIXME: This relies on the ordering of LogProb's in the dictionary. TorchSampler ensures
+                #        that the sampled logprob is in the first position.
                 self.cum_log_probs[beam_idx] += sum(
                     next(iter(prob.values())).logprob for prob in probs)
 
@@ -264,8 +270,6 @@ class PyResult:
         generation_logits_list: list[torch.Tensor] = field(default_factory=list)
         reset_log_probs: tuple[list[TokenLogprobs],
                                list[float] | None] | None = None
-        log_probs_list: list[tuple[list[TokenLogprobs], list[float]
-                                   | None]] = field(default_factory=list)
         mm_embeddings: list[dict[str, Any] | None] = None
         mrope_position_ids: dict[str, Any] | None = None
         mrope_position_deltas: dict[str, Any] | None = None
@@ -343,9 +347,6 @@ class PyResult:
                 self._generation_logits.append(generation_logits)
         if diff.reset_log_probs is not None:
             self._log_probs.set_log_probs(*diff.reset_log_probs)
-        if len(diff.log_probs_list) > 0:
-            for log_probs, cum_log_probs in diff.log_probs_list:
-                self._log_probs.append(log_probs, cum_log_probs)
         if diff.mm_embeddings is not None:
             self._mm_embeddings = diff.mm_embeddings
         if diff.mrope_position_ids is not None:
@@ -380,7 +381,6 @@ class PyResult:
                          cum_log_probs: Optional[list[float]] = None):
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
-            self.diff.log_probs_list.append((log_probs, cum_log_probs))
 
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
                              multimodal_lengths: List[int]):
@@ -441,7 +441,6 @@ class PyResult:
         if self._log_probs:
             self._log_probs.set_log_probs(log_probs, cum_log_probs)
             self.diff.reset_log_probs = (log_probs, cum_log_probs)
-            self.diff.log_probs_list.clear()
 
     @property
     def context_logits(self) -> torch.Tensor | None:
@@ -464,14 +463,33 @@ class PyResult:
             return None
         return storage.transpose(0, 1)
 
+    def get_latest_logits_unexcluded(self) -> torch.Tensor | None:
+        """Read the latest logits chunk, bypassing exclude_last_generation_logits.
+
+        Unlike the generation_logits property, this always returns the most
+        recent chunk regardless of the exclusion flag.  Callers are responsible
+        for ensuring the timing is correct (e.g. calling before the next
+        forward pass appends new logits).
+        """
+        if not self._generation_logits:
+            return None
+        storage = self._generation_logits.get(all_logits=False,
+                                              exclude_last=False)
+        if storage is None:
+            return None
+        return storage.transpose(0, 1)
+
     @property
     def log_probs(self) -> list[TokenLogprobs] | None:
-        return self._log_probs and hasattr(
-            self._log_probs, 'log_probs') and self._log_probs.log_probs
+        if not self._log_probs or not hasattr(self._log_probs, 'log_probs'):
+            return None
+        return self._log_probs.log_probs
 
     @property
     def cum_log_probs(self) -> list[float] | None:
-        return self._log_probs and self._log_probs.cum_log_probs
+        if not self._log_probs or not hasattr(self._log_probs, 'cum_log_probs'):
+            return None
+        return self._log_probs.cum_log_probs
 
     @property
     def mm_embedding_handles(self) -> List[Dict[str, Any]] | None:
@@ -605,6 +623,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logits_chunk_size: int = 8,
             logprobs_mode: LogprobMode = LogprobMode.RAW,
             **kwargs):
+        self.py_sampling_strategy: "Strategy | None" = None
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
@@ -691,6 +710,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_mode)  # handle passed a raw string
         self.py_disaggregated_params = None
 
+        self.py_num_connector_matched_tokens = 0
+
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
             max_new_tokens=self.py_max_new_tokens,
@@ -764,13 +785,35 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         result, is_final = super().create_serialized_result(
             use_fast_logits, mpi_world_rank)
 
-        # Performs a deep copy of py_result._log_probs to eliminate race conditions that may occur between IPC communication and the overriding of newly generated log_probs in streaming mode.
-        if self.streaming and self.py_result.log_probs and self.sampling_config.beam_width <= 1:
+        # When using beam search we cannot incrementically update the logprobs in the result.
+        # Instead we need to update all logprobs. In that case no deep copy is needed.
+        need_deep_copy_logprobs = self.py_result.log_probs and self.sampling_config.beam_width <= 1
+        need_deep_copy_generation_logits = self.py_result._generation_logits is not None
+        need_any_deep_copy = need_deep_copy_logprobs or need_deep_copy_generation_logits
+        # Performs a deep copy of py_result._log_probs or py_result._generation_logits to eliminate race conditions
+        # that may occur between IPC communication and the overriding of newly generated log_probs
+        # or the updating of py_result._generation_logits._logits_indices in streaming mode.
+        if self.streaming and need_any_deep_copy:
             py_result = copy(self.py_result)
-            py_result._log_probs = deepcopy(self.py_result._log_probs)
+            # Move _log_probs to py_result and create a new empty LogProbStorage in self.py_result
+            # This avoids performing a deepcopy
+            if need_deep_copy_logprobs:
+                py_result._log_probs = self.py_result._log_probs
+                self.py_result._log_probs = LogProbStorage()
+                # Initialize the storage and adjust the cum_log_probs to the previous value
+                self.py_result._log_probs._init(py_result.log_probs)
+                self.py_result._log_probs.cum_log_probs = py_result.cum_log_probs
 
-            for log_prob in self.py_result.log_probs:
-                log_prob.clear()
+            # Perform copies of py_result._generation_logits
+            if need_deep_copy_generation_logits:
+                # shallow copy of generation_logits to avoid copying the logits tensor
+                py_result._generation_logits = copy(
+                    self.py_result._generation_logits)
+                # deep copy the indices to avoid the race condition
+                # In streaming mode LogitsStorage only accesses either the last
+                # or second to last pair of indices. Therefore, copying only these two pairs is sufficient.
+                py_result._generation_logits._logits_indices = py_result._generation_logits._logits_indices[
+                    -2:]
         else:
             py_result = self.py_result
 
@@ -971,7 +1014,7 @@ def executor_request_to_llm_request(
         return_encoder_output=False,
         client_id=executor_request.client_id
         if executor_request.client_id is not None else req_id,
-        priority=0.5,
+        priority=executor_request.priority,
         llm_request_type=llm_request_type,
         context_phase_params=executor_request.context_phase_params,
         cache_salt_id=executor_request.cache_salt_id,
@@ -983,6 +1026,9 @@ def executor_request_to_llm_request(
                               LogprobMode.RAW),
     )
 
+    llm_request.py_original_end_id = getattr(executor_request,
+                                             "py_original_end_id",
+                                             llm_request.py_end_id)
     llm_request.py_disaggregated_params = getattr(executor_request,
                                                   "py_disaggregated_params",
                                                   None)
