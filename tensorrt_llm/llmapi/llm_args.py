@@ -577,6 +577,13 @@ class MoeConfig(StrictBaseModel):
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core']
 
+# Short aliases for built-in custom tokenizers.
+# Maps alias → full import path (module.ClassName).
+TOKENIZER_ALIASES = {
+    'deepseek_v32': 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
+    'glm_moe_dsa': 'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
+}
+
 
 class Nvfp4GemmConfig(StrictBaseModel):
     """
@@ -1127,6 +1134,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
             )
 
         self.num_eagle_layers = self.max_draft_len
+        self.max_total_draft_tokens = self.max_draft_len  # If using linear-tree, the max_total_draft_tokens is the same as max_draft_len
 
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
             # FIXME find a better way to setup it.
@@ -1155,8 +1163,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
             self.max_total_draft_tokens = len(self.eagle_choices)
 
         # Dynamic tree logic
-        if self.use_dynamic_tree or self.dynamic_tree_max_topK is not None:
-            self.use_dynamic_tree = True
+        if self.use_dynamic_tree:
             if self.eagle_choices is not None:
                 raise ValueError(
                     "If use_dynamic_tree is True, eagle_choices should be None")
@@ -1168,28 +1175,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
                 raise ValueError(
                     "dynamic_tree_max_topK should be provided, which indicates the number of nodes to expand each time"
                 )
-
-            default_max_total_draft_tokens = self.dynamic_tree_max_topK * self.max_draft_len
-
-            if self.max_total_draft_tokens is None:
-                self.max_total_draft_tokens = default_max_total_draft_tokens
-                logger.warning(
-                    f"max_total_draft_tokens is not provided, use the default value {default_max_total_draft_tokens} (default_max_total_draft_tokens = dynamic_tree_max_topK * max_draft_len)"
+            if self.max_total_draft_tokens is None or self.max_total_draft_tokens <= 0:
+                raise ValueError(
+                    "max_total_draft_tokens should be provided, which indicates the total nodes of the final draft tree. (exclude the root node)"
                 )
-            else:
-                if self.max_total_draft_tokens < self.max_draft_len:
-                    raise ValueError(
-                        f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be >= max_draft_len ({self.max_draft_len})"
-                    )
-                if self.max_total_draft_tokens > self.dynamic_tree_max_topK * self.max_draft_len:
-                    raise ValueError(
-                        f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be <= "
-                        f"dynamic_tree_max_topK * max_draft_len ({self.dynamic_tree_max_topK * self.max_draft_len})"
-                    )
-
-        # Linear tree
-        if self.max_total_draft_tokens is None:
-            self.max_total_draft_tokens = self.max_draft_len
 
         return self
 
@@ -1269,11 +1258,6 @@ class SAEnhancerConfig(StrictBaseModel):
 
 class Eagle3DecodingConfig(EagleDecodingConfig):
     decoding_type: Literal["Eagle3"] = "Eagle3"
-
-    max_batch_size: Optional[int] = Field(
-        default=None,
-        description="Max batch size for pre-allocating dynamic tree buffers. "
-        "Required when use_dynamic_tree=True.")
 
     sa_config: Optional[SAEnhancerConfig] = Field(
         default=None,
@@ -2291,8 +2275,8 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
 SpeculativeConfig: TypeAlias = Annotated[
     Union[
         DraftTargetDecodingConfig,
-        Eagle3DecodingConfig,  # Must be before EagleDecodingConfig since it's a subclass
         EagleDecodingConfig,
+        Eagle3DecodingConfig,
         LookaheadDecodingConfig,
         MedusaDecodingConfig,
         MTPDecodingConfig,
@@ -2352,8 +2336,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Size of the host cache in bytes. If both `max_tokens` and `host_cache_size` are specified, memory corresponding to the minimum will be used."
     )
-    onboard_blocks: bool = Field(
-        default=True, description="Controls if blocks are onboarded.")
     cross_kv_cache_fraction: Optional[float] = Field(
         default=None,
         description=
@@ -2449,14 +2431,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     )
 
     def _to_pybind(self):
-        return _KvCacheConfig(
+        config = _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
             max_tokens=self.max_tokens,
             max_attention_window=self.max_attention_window,
             sink_token_length=self.sink_token_length,
             free_gpu_memory_fraction=self.free_gpu_memory_fraction,
             host_cache_size=self.host_cache_size,
-            onboard_blocks=self.onboard_blocks,
             cross_kv_cache_fraction=self.cross_kv_cache_fraction,
             secondary_offload_min_priority=self.secondary_offload_min_priority,
             event_buffer_max_size=self.event_buffer_max_size,
@@ -2466,6 +2447,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             attention_dp_events_gather_period_ms=self.
             attention_dp_events_gather_period_ms,
             max_gpu_total_bytes=self.max_gpu_total_bytes)
+        return config
 
     @field_validator('free_gpu_memory_fraction')
     @classmethod
