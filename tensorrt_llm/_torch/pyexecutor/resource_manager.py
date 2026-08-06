@@ -19,8 +19,8 @@ import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
-                    Set, Tuple, Union)
+from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Optional,
+                    Sequence, Set, Tuple, Union)
 
 import torch
 from mpi4py import MPI
@@ -158,6 +158,18 @@ class BaseResourceManager(ABC):
 
     def free_resources(self, request: LlmRequest):
         pass
+
+    def discard_request(self, request: LlmRequest):
+        """Undo whatever ``prepare_resources`` did for ``request`` this
+        iteration, leaving it schedulable from scratch.
+
+        Unlike ``free_resources`` this is not a teardown: the request stays
+        active and will be scheduled again, so a manager must undo only the
+        state it created for the iteration being abandoned. Driven by
+        ``ResourceManager.discard_request`` from the token-budget trim's
+        last-resort path (GitHub issue #13318); a manager that holds no
+        per-iteration state needs no override.
+        """
 
     def shutdown(self):
         pass
@@ -851,7 +863,122 @@ class KVCacheManager(BaseResourceManager):
         req.context_chunk_size = new_chunk
         return current - new_chunk
 
-    def fit_token_budget(self, scheduled_batch: ScheduledRequests) -> None:
+    @staticmethod
+    def _can_discard(req: LlmRequest) -> bool:
+        """Whether ``req`` can be unscheduled entirely and retried from scratch.
+
+        Only a request that has not computed any of its context yet:
+        ``is_first_context_chunk`` means ``context_current_position`` is still at
+        ``prepopulated_prompt_len``, so discarding throws away no computed work
+        and the retry re-enters ``addSequence`` cleanly. That is also exactly the
+        population the scheduler can over-admit --
+        ``getEstimatedReusableTokens`` (llmRequest.h) returns 0 for later chunks,
+        so their cost was charged exactly and they are never the reason the
+        batch is over budget.
+
+        Disagg generation-init requests are excluded: they contribute no compute
+        tokens, so there is nothing to shed, and their KV cache is being filled
+        by an in-flight transfer.
+        """
+        return (req.is_first_context_chunk
+                and not req.is_disagg_generation_init_state)
+
+    def discard_request(self, request: LlmRequest) -> None:
+        """Release this iteration's context allocation for ``request``.
+
+        This request has not run a forward pass, so none of the blocks just
+        allocated for it hold computed KV and none of them may reach the reuse
+        trie. ``removeSequence`` decides that from the request's own cursor
+        (``releaseBlocks`` -> ``getUsableUniqueTokenCountForReuse``,
+        kvCacheManager.cpp): while context remains it stores
+        ``min(num_tokens, context_current_position) - 1`` tokens' worth of
+        blocks. Two positions are therefore unsafe to remove at:
+
+        * the real one, which after ``addSequence`` sits at
+          ``prepopulated_prompt_len`` -- harmless in itself (that prefix is
+          genuinely materialized) but it re-stores blocks for no reason;
+        * zero, which trips ``releaseBlocks``' legacy-test fallback -- it reads
+          a zero count at position zero as "prefill complete" and stores
+          ``num_tokens - 1`` tokens of *uninitialized* blocks, silently
+          corrupting every later request that matches the prefix.
+
+        Parking the cursor at 1 for the call yields a usable count of 0, which
+        ``chopVectorIntoBlocks`` turns into no blocks at all, and keeps the
+        fallback's ``position == 0`` guard false. (Passing ``llm_request=None``
+        would be the direct way to say this, but the binding does not accept
+        None for that argument.)
+
+        The cursor is then rewound the rest of the way so the retry looks like a
+        fresh arrival. ``addSequence`` had advanced it to
+        ``prepopulated_prompt_len`` (``setPrepopulatedPromptLen``,
+        llmRequest.h); leaving it advanced once the blocks are gone would make
+        the next ``addSequence`` -- which only moves the position when it finds
+        a non-zero reuse hit -- skip recomputing a prefix that no longer has any
+        KV cache behind it.
+        """
+        request.context_current_position = 1
+        self.impl.remove_sequence(request.py_request_id, request, False)
+        # Then the same reset LlmRequest::pause performs (llmRequest.h), which is
+        # the codebase's own definition of "back at the start of the context
+        # phase". Restoring the chunk size to the whole prompt is load-bearing,
+        # not tidiness: with chunked prefill disabled nothing re-chunks the
+        # request before the next addSequence, and setPrepopulatedPromptLen
+        # would then compute flooredEnd - prepopulated_prompt_len from a zero
+        # chunk -- a negative chunk size, which setContextChunkSize rejects.
+        # Clearing the reuse estimate matters for the same reason the trim
+        # exists: it is the stale guess that over-admitted this request.
+        request.set_prepopulated_prompt_len(0, self.tokens_per_block)
+        request.context_current_position = 0
+        request.context_chunk_size = request.prompt_len
+        request.estimated_reusable_tokens = 0
+
+    def _discard_context_requests(self, scheduled_batch: ScheduledRequests,
+                                  excess: int, discard: Callable[[LlmRequest],
+                                                                 None],
+                                  context_requests: RequestList) -> int:
+        """Unschedule whole context requests until ``excess`` tokens are shed.
+
+        Returns the number of forward-pass tokens shed; ``context_requests`` is
+        updated in place to those still scheduled. Shedding runs from the back
+        for the same reason shrinking does -- the requests whose cost the
+        scheduler can have under-charged are at the end.
+        """
+        if self.kv_connector_manager is not None:
+            # prepare_resources has already reported this batch to the connector
+            # via build_scheduler_output, and update_state_after_alloc has fired
+            # for every request in it. The connector API has no inverse for
+            # either, so a request cannot be withdrawn here.
+            logger.warning(
+                "fit_token_budget: cannot unschedule context requests while a "
+                "KV connector is attached; the batch stays over budget.")
+            return 0
+
+        # batch_size is what the attention-DP _can_queue vote allgathered
+        # (py_executor._can_queue: can_queue = 0 not in tp_batch_sizes) before
+        # prepare_resources ran. Emptying this rank's batch after that vote
+        # passed leaves peers blocked in a collective this rank never enters, so
+        # the batch must keep at least one request. One context request held at
+        # its one-block floor is affordable in any configuration where
+        # generation alone fits.
+        remaining = scheduled_batch.batch_size
+        keep: RequestList = []
+        shed = 0
+        for req in reversed(context_requests):
+            if shed >= excess or remaining <= 1 or not self._can_discard(req):
+                keep.append(req)
+                continue
+            shed += self._request_forward_tokens(req, is_context=True)
+            remaining -= 1
+            discard(req)
+        keep.reverse()
+        context_requests[:] = keep
+        return shed
+
+    def fit_token_budget(
+            self,
+            scheduled_batch: ScheduledRequests,
+            discard: Optional[Callable[[LlmRequest],
+                                       None]] = None) -> RequestList:
         """Shrink over-budget context chunks so the forward pass cannot exceed
         ``max_num_tokens``.
 
@@ -874,13 +1001,34 @@ class KVCacheManager(BaseResourceManager):
         ``context_chunk_size`` are final and ``_request_forward_tokens`` is
         exact.
 
-        Shrink only, never defer. KV cache is already allocated and sequences
-        are already added, so a request cannot be dropped from the batch at this
-        point -- but it does not need to be. Blocks are allocated for the full
-        chunk; the tokens trimmed here are simply computed on the next
-        iteration. Because nothing leaves the batch, this cannot desynchronize
-        the attention-DP ``_can_queue`` vote, the inflight set, or any earlier
-        manager's per-request state.
+        Shrinking is the primary lever and is nearly free: blocks are allocated
+        for the whole prompt rather than the chunk
+        (``_collect_context_sequences`` sizes ``add_sequence_batch`` from
+        ``prompt_len``), so trimming a chunk changes no block accounting and the
+        tokens simply move to the next iteration. Nothing leaves the batch, so
+        the attention-DP ``_can_queue`` vote, the PP inflight set and every
+        earlier manager's per-request state stay consistent.
+
+        Shrinking alone is not always enough, and is sometimes not available at
+        all:
+
+        * ``_shrink_context_chunk`` bottoms out at one block of progress per
+          request, so a batch admitted with many under-charged context requests
+          can exceed the budget by more than the sum of what its chunks can give
+          up;
+        * with chunked prefill disabled there is no shrink tier -- a shrunk
+          chunk is a partial context chunk, which the attention backend cannot
+          consume -- so everything over budget has to come off as whole
+          requests.
+
+        In both cases, when ``discard`` is supplied, context requests are
+        unscheduled outright until the batch fits. That is the last resort: it
+        costs the KV cache work already done for them, but the alternative is
+        the ``_prepare_tp_inputs`` assert, which fails every request in the
+        batch and kills the executor loop. Unscheduling is safe with chunked
+        prefill off precisely because it leaves no partial chunk behind -- the
+        request re-enters the scheduler from its first chunk like a new arrival.
+        See ``ResourceManager.discard_request`` for what that unwinds.
 
         Context requests are the only work this can shed, so a batch with none
         returns immediately -- keeping the gen-only batch (the executor loop's
@@ -890,7 +1038,7 @@ class KVCacheManager(BaseResourceManager):
         # property, which concatenates them into a fresh list on every access.
         if (not scheduled_batch.context_requests_chunking
                 and not scheduled_batch.context_requests_last_chunk):
-            return
+            return []
 
         budget = self.max_num_tokens
         total = sum(
@@ -904,64 +1052,113 @@ class KVCacheManager(BaseResourceManager):
 
         excess = total - budget
         if excess <= 0:
-            return
+            return []
 
+        shed = 0
         if not self.enable_chunked_prefill:
             # A shrunk chunk is a partial context chunk, which the attention
             # backend is only set up to consume under chunked prefill; forcing
             # one produces an invalid forward pass (empty-query asserts /
-            # missing quantized KV buffers / cudaErrorInvalidValue). Nothing
-            # safe is left to do, so let the assert fire as it does on main.
-            logger.warning(
-                f"Scheduled batch needs {total} forward-pass tokens, exceeding "
-                f"max_num_tokens ({budget}) by {excess}. Cannot trim: chunked "
-                "prefill is disabled. See GitHub issue #13318.")
-            return
+            # missing quantized KV buffers / cudaErrorInvalidValue). So the
+            # shrink tier is skipped entirely and everything over budget has to
+            # come off as whole requests below -- unscheduling produces no
+            # partial chunk, since the request leaves the batch and is scheduled
+            # again from its first chunk like any new arrival.
+            logger.debug(
+                f"fit_token_budget: {excess} tokens over max_num_tokens "
+                f"({budget}) with chunked prefill disabled; chunks cannot be "
+                "shrunk, so context requests are unscheduled instead.")
+        else:
+            # Shed from the back. ``context_requests`` is
+            # ``context_requests_chunking + context_requests_last_chunk``, so
+            # this trims last-chunk requests first -- which is where the
+            # overshoot comes from: only a last chunk carries a reuse discount
+            # (reuse_adjusted_compute's last-chunk branch) and draft tokens, so
+            # it is the request whose cost the scheduler can have under-charged.
+            # Trimming it converts it back into a chunking request, which is
+            # exactly the repair. Mid-prefill chunks are touched only if that is
+            # not enough.
+            for req in reversed(context_requests):
+                if excess - shed <= 0:
+                    break
+                # Disagg generation-init requests only allocate/transfer KV
+                # cache and contribute no compute tokens, so nothing to shed.
+                if req.is_disagg_generation_init_state:
+                    continue
+                # Re-chunking a request whose boundary would split a
+                # bidirectional multimodal block silently breaks attention.
+                if self._has_mm_bidirectional_block(req):
+                    continue
+                shed += self._shrink_context_chunk(req, excess - shed)
 
-        # Shed from the back. ``context_requests`` is
-        # ``context_requests_chunking + context_requests_last_chunk``, so this
-        # trims last-chunk requests first -- which is where the overshoot comes
-        # from: only a last chunk carries a reuse discount
-        # (reuse_adjusted_compute's last-chunk branch) and draft tokens, so it is
-        # the request whose cost the scheduler can have under-charged. Trimming
-        # it converts it back into a chunking request, which is exactly the
-        # repair. Mid-prefill chunks are touched only if that is not enough.
-        shed = 0
-        for req in reversed(context_requests):
-            if excess - shed <= 0:
-                break
-            # Disagg generation-init requests only allocate/transfer KV cache
-            # and contribute no compute tokens, so there is nothing to shed.
-            if req.is_disagg_generation_init_state:
-                continue
-            # Re-chunking a request whose boundary would split a bidirectional
-            # multimodal block silently breaks attention.
-            if self._has_mm_bidirectional_block(req):
-                continue
-            shed += self._shrink_context_chunk(req, excess - shed)
+        # Shrinking is spent -- every chunk is at its floor, or it was never
+        # available because chunked prefill is off -- and the batch is still
+        # over budget. The only tokens left to shed belong to whole requests.
+        num_discarded = 0
+        if shed < excess and discard is not None:
+            before = len(context_requests)
+            shed += self._discard_context_requests(scheduled_batch,
+                                                   excess - shed, discard,
+                                                   context_requests)
+            num_discarded = before - len(context_requests)
 
         if shed:
             logger.debug(
-                f"fit_token_budget: trimmed {shed} context tokens from "
-                f"{scheduled_batch.num_context_requests} context requests to "
-                f"stay within max_num_tokens={budget}")
+                f"fit_token_budget: shed {shed} context tokens "
+                f"({num_discarded} request(s) unscheduled) to stay within "
+                f"max_num_tokens={budget}")
             # Re-bin from each request's (possibly updated)
             # is_last_context_chunk: a shrunk request is no longer a last chunk.
+            # Discarded requests are already out of ``context_requests``.
             scheduled_batch.reset_context_requests(context_requests)
 
-        if shed < excess:
+        if num_discarded:
+            reason = ("chunked prefill is disabled, so chunks could not be "
+                      "shrunk" if not self.enable_chunked_prefill else
+                      "shrinking context chunks was not enough")
             logger.warning(
-                f"Scheduled batch needs {total} forward-pass tokens, exceeding "
-                f"max_num_tokens ({budget}); could only trim {shed}. See "
+                f"Scheduled batch needed {total} forward-pass tokens, exceeding "
+                f"max_num_tokens ({budget}); {reason}, so {num_discarded} "
+                "context request(s) were unscheduled and will be retried. See "
                 "GitHub issue #13318.")
 
-    def maybe_fit_token_budget(self,
-                               scheduled_batch: ScheduledRequests) -> None:
-        """Apply the post-allocation token-budget trim to ``scheduled_batch``."""
-        if not self.is_draft:
+        if shed >= excess:
+            return []
+
+        logger.warning(
+            f"Scheduled batch needs {total} forward-pass tokens, exceeding "
+            f"max_num_tokens ({budget}); could only trim {shed}. See "
+            "GitHub issue #13318.")
+
+        # Everything that could be shed has been, and the batch is still over
+        # budget. If what is left is a single context request costing more than
+        # the whole budget, no batch can ever hold it: it cannot be shrunk (or
+        # it would have been), and it cannot be unscheduled without emptying the
+        # batch, so retrying it just rebuilds this same batch forever. Report it
+        # so the executor can fail it against the client instead.
+        if scheduled_batch.batch_size != 1 or not context_requests:
+            return []
+        remaining = context_requests[0]
+        if self._request_forward_tokens(remaining, is_context=True) <= budget:
+            return []
+        return [remaining]
+
+    def maybe_fit_token_budget(
+            self,
+            scheduled_batch: ScheduledRequests,
+            discard: Optional[Callable[[LlmRequest],
+                                       None]] = None) -> RequestList:
+        """Apply the post-allocation token-budget trim to ``scheduled_batch``.
+
+        ``discard`` unschedules a request across every resource manager; without
+        it the trim can only shrink chunks. Returns the requests that could not
+        be made to fit and have to be failed (empty in the normal case).
+        """
+        if self.is_draft:
             # The draft-model engine builds inputs with a different token shape;
             # its budget is handled separately.
-            self.fit_token_budget(scheduled_batch)
+            return []
+        return self.fit_token_budget(scheduled_batch, discard)
 
     def _context_seq_len(self, req: LlmRequest, is_cross: bool,
                          is_star_cp: bool) -> Optional[int]:
@@ -1058,6 +1255,12 @@ class KVCacheManager(BaseResourceManager):
         before the trim over-states it for every chunk the trim shrinks, and a
         connector that decides what to save or offload from that count would
         publish KV for tokens the forward pass never computed.
+
+        Running after the trim also keeps a request the trim unscheduled out of
+        the scheduler output entirely, and out of the connector's per-request
+        table -- that table is a ``defaultdict`` populated only from here, so an
+        entry created for an unscheduled request would make its retry look
+        already-known, with block ids that have since been freed.
         """
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.build_scheduler_output(
@@ -2861,25 +3064,54 @@ class ResourceManager:
           reusable prefix -- it is not a token count, and reading it as one
           over-charges a reuse hit by the whole cached prefix.
 
-        Trimming this late is only safe because it shrinks rather than defers;
-        nothing leaves the batch, so the attention-DP _can_queue vote, the PP
-        inflight set and every earlier manager's per-request state all stay
-        consistent with the batch they were computed from.
+        Shrinking is free at this point and never changes the batch. When it is
+        not enough -- or not available, with chunked prefill off -- whole
+        requests are unscheduled instead, always leaving at least one so the
+        attention-DP _can_queue vote taken before prepare_resources stays valid.
+
+        Returns the requests that could not be made to fit by either lever and
+        have to be failed; empty in the normal case.
         """
         kv_cache_manager = self.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        if kv_cache_manager is not None and hasattr(kv_cache_manager,
-                                                    "maybe_fit_token_budget"):
-            kv_cache_manager.maybe_fit_token_budget(scheduled_batch)
+        if kv_cache_manager is None or not hasattr(kv_cache_manager,
+                                                   "maybe_fit_token_budget"):
+            return []
+        return kv_cache_manager.maybe_fit_token_budget(scheduled_batch,
+                                                       self.discard_request)
+
+    def discard_request(self, request: LlmRequest):
+        """Undo this iteration's preparation of ``request`` across all managers.
+
+        The request stays active and schedulable -- this abandons one iteration
+        of work for it, it does not terminate it, so each manager undoes only
+        what its own ``prepare_resources`` did (``BaseResourceManager.
+        discard_request``). Reverse manager order mirrors ``free_resources``.
+
+        Every manager has to be given the chance to undo, not just the KV cache
+        manager: the Eagle3 / MTP resource managers allocate a slot per
+        first-context-chunk request, and ``SlotManager.add_slot`` asserts on a
+        duplicate request id, so a discarded request that kept its slot would
+        abort the executor loop when it is scheduled again.
+        """
+        for _, resource_manager in reversed(self.resource_managers.items()):
+            if hasattr(resource_manager, "discard_request"):
+                resource_manager.discard_request(request)
 
     @nvtx_range("prepare_resources")
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(self,
+                          scheduled_batch: ScheduledRequests) -> RequestList:
+        """Prepare every manager, then fit the batch to the token budget.
+
+        Returns the requests the budget trim could not fit, which the caller
+        must fail (``PyExecutor._fail_unfittable_requests``). Empty normally.
+        """
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "prepare_resources"):
                 resource_manager.prepare_resources(scheduled_batch)
         # After every manager, so context_current_position / context_chunk_size
         # are final. See maybe_fit_token_budget.
-        self.maybe_fit_token_budget(scheduled_batch)
+        unfittable = self.maybe_fit_token_budget(scheduled_batch)
         # Strictly after the trim: the connector is told how many tokens the
         # forward pass will compute, which is only settled once the trim has
         # run. See KVCacheManager.publish_connector_scheduler_output.
@@ -2887,6 +3119,7 @@ class ResourceManager:
             ResourceManagerType.KV_CACHE_MANAGER)
         if hasattr(kv_cache_manager, "publish_connector_scheduler_output"):
             kv_cache_manager.publish_connector_scheduler_output(scheduled_batch)
+        return unfittable
 
     @nvtx_range("update_resources")
     def update_resources(

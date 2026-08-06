@@ -122,6 +122,25 @@ class Eagle3ResourceManager(BaseResourceManager):
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass
 
+    def discard_request(self, request: LlmRequest):
+        """Undo the slot this iteration's prepare_resources allocated.
+
+        Only a first-context-chunk request can be discarded (see
+        ``KVCacheManager._can_discard``), which is exactly the condition under
+        which prepare_resources allocated a slot for it. Without this the
+        request's retry would hit ``SlotManager.add_slot``'s duplicate-id
+        assert. ``slot_ids`` is rebuilt every iteration but is consumed after
+        the trim, so the discarded slot has to come back out of it.
+        """
+        slot_id = self.slot_manager.get_slot(request.request_id)
+        if slot_id is None:
+            return
+        if self.use_relaxed_acceptance_for_thinking:
+            self.relaxed_delta_pool[slot_id].fill_(0)
+        if slot_id in self.slot_ids:
+            self.slot_ids.remove(slot_id)
+        self.slot_manager.remove_slot(request.request_id)
+
     def free_resources(self, request: LlmRequest):
         slot_id = self.slot_manager.get_slot(request.request_id)
         self.seq_lens[slot_id] = 0

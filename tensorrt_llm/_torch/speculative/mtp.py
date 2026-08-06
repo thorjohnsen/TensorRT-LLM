@@ -93,6 +93,19 @@ class MTPHiddenStatesManager(BaseResourceManager):
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass
 
+    def discard_request(self, request: LlmRequest):
+        """Undo the slot this iteration's prepare_resources allocated.
+
+        See ``Eagle3ResourceManager.discard_request``: without it the discarded
+        request's retry trips ``SlotManager.add_slot``'s duplicate-id assert.
+        """
+        slot_id = self.slot_manager.get_slot(request.request_id)
+        if slot_id is None:
+            return
+        if self.use_relaxed_acceptance_for_thinking:
+            self.mtp_relaxed_delta_pool[slot_id].copy_(0, non_blocking=True)
+        self.slot_manager.remove_slot(request.request_id)
+
     def free_resources(self, request: LlmRequest):
         free_slot_id = self.slot_manager.get_slot(request.request_id)
         if self.use_relaxed_acceptance_for_thinking:

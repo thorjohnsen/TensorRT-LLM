@@ -2616,14 +2616,14 @@ class PyExecutor:
                     self._run_encoder_step(scheduled_batch.encoder_requests)
 
                 can_queue, _ = self._can_queue(scheduled_batch)
-                if not can_queue:
-                    self._revert_gen_alloc(scheduled_batch)
-                if not can_queue:
-                    logger.debug(
-                        f"microbatch {microbatch_id} cannot be queued, skipping"
-                    )
-                    self.micro_batches[microbatch_id] = None
-                else:
+
+                # Preparation runs before the queue/skip split rather than
+                # inside it, because the token-budget trim at the end of
+                # prepare_resources can fail a request -- and that empties the
+                # batch, since a request is only reported when it is the last
+                # one left. can_queue therefore has to be answerable again
+                # between preparing the batch and committing to run it.
+                if can_queue:
                     logger.debug(f"microbatch {microbatch_id} can be queued")
 
                     if not self.pp_async_broadcast_sample_state:
@@ -2642,8 +2642,26 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    self.resource_manager.prepare_resources(scheduled_batch)
+                    unfittable = self.resource_manager.prepare_resources(
+                        scheduled_batch)
+                    if self._fail_unfittable_requests(scheduled_batch,
+                                                      unfittable):
+                        can_queue, _ = self._can_queue(scheduled_batch)
+                        if not can_queue:
+                            # Skipping a microbatch is routine here, but the
+                            # paired _remove_inflight_ids at the end of this
+                            # loop only runs for microbatches that executed.
+                            # Ids left behind are never erased and the
+                            # scheduler skips them forever.
+                            self._remove_inflight_ids(scheduled_batch)
 
+                if not can_queue:
+                    self._revert_gen_alloc(scheduled_batch)
+                    logger.debug(
+                        f"microbatch {microbatch_id} cannot be queued, skipping"
+                    )
+                    self.micro_batches[microbatch_id] = None
+                else:
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
                     # made in model_engine.py::_forward_step. This is only important
@@ -3908,6 +3926,65 @@ class PyExecutor:
                 return can_forward, True
         return can_forward, False
 
+    def _fail_unfittable_requests(self, scheduled_batch: ScheduledRequests,
+                                  unfittable: List[LlmRequest]) -> bool:
+        """Fail requests the token-budget trim could not fit, ADP-safely.
+
+        ``ResourceManager.prepare_resources`` reports a request only when no
+        batch can ever hold it: it costs more than ``max_num_tokens`` on its
+        own, it cannot be shrunk, and it cannot be unscheduled because it is the
+        last request in the batch. Retrying it rebuilds this same batch forever,
+        and running it trips the ``_prepare_tp_inputs`` assert, which fails the
+        whole batch and kills the executor loop (GitHub issue #13318). Failing
+        it against the client is the only outcome that leaves the server
+        serving.
+
+        The decision is rank-local, but ``_handle_errors`` reaches
+        ``_enqueue_responses``, whose ``tp_gather`` deadlocks unless every rank
+        enters it -- the same hazard ``_handle_disagg_cache_errors_synced``
+        exists for. So the ranks agree first, then all of them call
+        ``_handle_errors`` (most with an empty list).
+
+        Returns whether any rank failed a request. That answer is uniform, so
+        callers can safely gate collective work -- specifically the ``_can_queue``
+        re-vote they must run, since this rank's batch is now empty.
+
+        Not exercised under attention DP: that configuration could not be run
+        while this was written (a no-injection baseline hangs identically on
+        code without any of this, so nothing about it was measured). The
+        rank-agreement shape above was observed working -- a peer with nothing of
+        its own still enters ``_handle_errors`` -- but what happens after this
+        rank's batch becomes empty was not, and the loop pairs its collectives
+        around ``should_process_previous_batch``. Worth verifying there first.
+        """
+        if self.enable_attention_dp and self.dist.world_size != 1:
+            any_unfittable = any(self.dist.tp_allgather(bool(unfittable)))
+        else:
+            any_unfittable = bool(unfittable)
+        if not any_unfittable:
+            return False
+
+        for request in unfittable:
+            logger.error(
+                f"Request {request.py_request_id} needs "
+                f"{request.context_chunk_size} forward-pass tokens, more than "
+                f"max_num_tokens; it cannot be split (chunked prefill is "
+                "disabled) and cannot be deferred, so it is being failed. See "
+                "GitHub issue #13318.")
+        # Out of the batch before the forward pass: these requests are being
+        # terminated, so nothing downstream may still see them scheduled.
+        if unfittable:
+            unfittable_ids = {req.py_request_id for req in unfittable}
+            scheduled_batch.reset_context_requests([
+                req for req in scheduled_batch.context_requests
+                if req.py_request_id not in unfittable_ids
+            ])
+        self._handle_errors(
+            "Request exceeds max_num_tokens and cannot be chunked",
+            requests=unfittable,
+            charge_budget=False)
+        return True
+
     @nvtx_range("_handle_disagg_cache_errors_synced")
     def _handle_disagg_cache_errors_synced(self):
         """Rank-safe disagg cache error and poison handler.
@@ -4078,7 +4155,15 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    self.resource_manager.prepare_resources(scheduled_batch)
+                    unfittable = self.resource_manager.prepare_resources(
+                        scheduled_batch)
+                    if self._fail_unfittable_requests(scheduled_batch,
+                                                      unfittable):
+                        # A failed request was the last one in its batch, so
+                        # that rank has nothing left to forward. Re-vote for the
+                        # same reason the kv-connector path does below. Safe
+                        # because the return value is agreed across ranks.
+                        can_queue, _ = self._can_queue(scheduled_batch)
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
@@ -4555,7 +4640,16 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    self.resource_manager.prepare_resources(scheduled_batch)
+                    unfittable = self.resource_manager.prepare_resources(
+                        scheduled_batch)
+                    if self._fail_unfittable_requests(scheduled_batch,
+                                                      unfittable):
+                        # A failed request was the last one in its batch, so
+                        # that rank has nothing left to forward. Re-vote for the
+                        # same reason the kv-connector path does below. Safe
+                        # because the return value is agreed across ranks.
+                        can_queue, can_queue_this_rank = self._can_queue(
+                            scheduled_batch)
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
@@ -7132,8 +7226,11 @@ class PyExecutor:
         This is load-bearing, not defensive. In this loop the next step is
         ``resource_manager.prepare_resources``, which runs
         ``ResourceManager.maybe_fit_token_budget`` at its end -- and that can
-        shrink a context request out of ``context_requests_last_chunk``. By
-        removal time the batch no longer agrees with what was inserted here.
+        shrink a context request out of ``context_requests_last_chunk``, or
+        unschedule one from the batch outright. By removal time the batch no
+        longer agrees with what was inserted here. Erasing by record is also
+        what makes an unscheduled request schedulable again on the next
+        iteration.
         """
         added: List[int] = []
         for req in scheduled_requests.context_requests_last_chunk:

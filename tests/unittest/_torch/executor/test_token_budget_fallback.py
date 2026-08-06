@@ -42,6 +42,7 @@ class _FakeRequest:
         py_draft_tokens=None,
         is_disagg_generation_init_state=False,
         mm_bidirectional=False,
+        prepopulated_prompt_len=0,
     ):
         _FakeRequest._next_id += 1
         self.py_request_id = _FakeRequest._next_id
@@ -61,6 +62,24 @@ class _FakeRequest:
         self.py_draft_tokens = py_draft_tokens
         self.is_disagg_generation_init_state = is_disagg_generation_init_state
         self.py_multimodal_data = {"mm_bidirectional_blocks": True} if mm_bidirectional else None
+        self.prepopulated_prompt_len = prepopulated_prompt_len
+        # The discard path rewinds to a fresh-arrival state, which is expressed
+        # in terms of prompt_len and the scheduler's reuse estimate.
+        self.prompt_len = prompt_len if prompt_len is not None else context_chunk_size
+        self.estimated_reusable_tokens = 0
+
+    def set_prepopulated_prompt_len(self, prepopulated_prompt_len, kv_tokens_per_block):
+        # C++ only advances context_current_position for a non-zero reuse hit;
+        # the discard path relies on that asymmetry, so mirror it exactly.
+        self.prepopulated_prompt_len = prepopulated_prompt_len
+        if prepopulated_prompt_len > 0:
+            self.context_current_position = prepopulated_prompt_len
+
+    @property
+    def is_first_context_chunk(self):
+        # C++: getContextCurrentPosition() == getPrepopulatedPromptLen(), i.e.
+        # nothing of this request's context has been computed yet.
+        return self.context_current_position == self.prepopulated_prompt_len
 
     @property
     def is_last_context_chunk(self):
@@ -88,10 +107,24 @@ def _make_manager(max_num_tokens, tokens_per_block, enable_chunked_prefill=True)
     # covered explicitly below.
     mgr.enable_chunked_prefill = enable_chunked_prefill
     mgr.is_draft = False
-    # Read by publish_connector_scheduler_output; most tests run without a
-    # connector attached.
+    # The discard path refuses to unschedule anything while a connector is
+    # attached (it has no inverse for update_state_after_alloc).
     mgr.kv_connector_manager = None
     return mgr
+
+
+class _RecordingDiscard:
+    """Stands in for ResourceManager.discard_request."""
+
+    def __init__(self):
+        self.discarded = []
+
+    def __call__(self, req):
+        self.discarded.append(req)
+
+    @property
+    def ids(self):
+        return [r.py_request_id for r in self.discarded]
 
 
 def _make_batch(context_requests=(), generation_requests=()):
@@ -308,7 +341,10 @@ class TestFitTokenBudget(unittest.TestCase):
 
     def test_no_shrink_when_chunked_prefill_disabled(self):
         # A partial context chunk is only valid under chunked prefill; forcing
-        # one produces an invalid forward pass. Nothing safe is left to do.
+        # one produces an invalid forward pass. With no discard callback that
+        # leaves nothing to do -- unscheduling whole requests, which is what
+        # this configuration actually falls back to, is covered by
+        # TestDiscardWhenShrinkIsNotEnough.
         mgr = _make_manager(max_num_tokens=128, tokens_per_block=16, enable_chunked_prefill=False)
         ctx = _FakeRequest(context_chunk_size=64, prompt_len=64)
         gen = _FakeRequest(py_beam_width=100)
@@ -509,7 +545,418 @@ class TestInflightIdsSurviveTrim(unittest.TestCase):
             self.assertNotIn(req.request_id, executor.inflight_req_ids)
 
 
-class TestConnectorSeesTheTrimmedBatch(unittest.TestCase):
+class TestDiscardWhenShrinkIsNotEnough(unittest.TestCase):
+    """The last-resort tier.
+
+    ``_shrink_context_chunk`` floors every request at one block of forward
+    progress, so a batch admitted with many under-charged context requests can
+    sit above ``max_num_tokens`` even once every chunk is at its floor: the
+    smallest batch shrinking can produce is ``n_ctx * tokens_per_block``. Doing
+    nothing there means the ``_prepare_tp_inputs`` assert, which fails every
+    request in the batch and kills the executor loop (#13318), so requests are
+    unscheduled until the batch fits.
+    """
+
+    TPB = 32
+
+    def _maxed_batch(self, n_ctx, prompt_len=4096, n_gen=0):
+        """n_ctx first-chunk requests each needing its whole prompt."""
+        ctx = [
+            _FakeRequest(context_chunk_size=prompt_len, prompt_len=prompt_len) for _ in range(n_ctx)
+        ]
+        gen = [
+            _FakeRequest(context_chunk_size=0, is_last_context_chunk=False) for _ in range(n_gen)
+        ]
+        return ctx, gen, _make_batch(ctx, gen)
+
+    def test_unschedules_until_the_batch_fits(self):
+        # 8 requests, floor 8*32 = 256, budget 128 -> shrinking cannot get there.
+        mgr = _make_manager(max_num_tokens=128, tokens_per_block=self.TPB)
+        ctx, _, batch = self._maxed_batch(8)
+        discard = _RecordingDiscard()
+
+        mgr.fit_token_budget(batch, discard)
+
+        self.assertLessEqual(_forward_tokens(mgr, batch), 128)
+        # Exactly the surplus: 4 kept at a 32-token floor == the 128 budget.
+        self.assertEqual(len(discard.discarded), 4)
+        self.assertEqual(batch.num_context_requests, 4)
+        # Shed from the back, so the survivors are the front of the batch.
+        self.assertEqual(
+            [r.py_request_id for r in batch.context_requests],
+            [r.py_request_id for r in ctx[:4]],
+        )
+        for req in discard.discarded:
+            self.assertNotIn(req, batch.context_requests)
+
+    def test_shrinking_is_preferred_and_discard_is_untouched(self):
+        # Same batch, a budget the floor fits under: nothing may be unscheduled.
+        mgr = _make_manager(max_num_tokens=512, tokens_per_block=self.TPB)
+        _, _, batch = self._maxed_batch(8)
+        discard = _RecordingDiscard()
+
+        mgr.fit_token_budget(batch, discard)
+
+        self.assertEqual(discard.discarded, [])
+        self.assertEqual(batch.num_context_requests, 8)
+        self.assertLessEqual(_forward_tokens(mgr, batch), 512)
+
+    def test_without_a_discard_callback_the_trim_only_shrinks(self):
+        # Part 2 behaviour is the default: a caller that supplies no callback
+        # gets shrink-only, over budget but with the batch intact.
+        mgr = _make_manager(max_num_tokens=128, tokens_per_block=self.TPB)
+        _, _, batch = self._maxed_batch(8)
+
+        mgr.fit_token_budget(batch)
+
+        self.assertEqual(batch.num_context_requests, 8)
+        self.assertGreater(_forward_tokens(mgr, batch), 128)
+
+    def test_never_empties_the_batch(self):
+        # A budget below even a single block. The batch feeds the attention-DP
+        # _can_queue vote (0 not in tp_batch_sizes), taken before
+        # prepare_resources; emptying it here would leave peers blocked in a
+        # collective this rank never enters.
+        mgr = _make_manager(max_num_tokens=16, tokens_per_block=self.TPB)
+        _, _, batch = self._maxed_batch(4)
+        discard = _RecordingDiscard()
+
+        mgr.fit_token_budget(batch, discard)
+
+        self.assertEqual(batch.batch_size, 1)
+        self.assertEqual(len(discard.discarded), 3)
+        # Still over budget -- reported, not asserted on.
+        self.assertGreater(_forward_tokens(mgr, batch), 16)
+
+    def test_only_as_many_as_the_budget_needs_are_unscheduled(self):
+        # 4 requests at a 32-token floor plus 8 generation tokens is 136; a
+        # budget of 64 is met by giving up 3 of them, so the 4th stays.
+        mgr = _make_manager(max_num_tokens=64, tokens_per_block=self.TPB)
+        _, _, batch = self._maxed_batch(4, n_gen=8)
+        discard = _RecordingDiscard()
+
+        mgr.fit_token_budget(batch, discard)
+
+        self.assertEqual(len(discard.discarded), 3)
+        self.assertEqual(batch.num_context_requests, 1)
+        self.assertLessEqual(_forward_tokens(mgr, batch), 64)
+
+    def test_generation_requests_let_every_context_request_go(self):
+        # With generation requests in the batch it stays non-empty without any
+        # context request, so all of them may be unscheduled.
+        mgr = _make_manager(max_num_tokens=16, tokens_per_block=self.TPB)
+        _, gen, batch = self._maxed_batch(4, n_gen=8)
+        discard = _RecordingDiscard()
+
+        mgr.fit_token_budget(batch, discard)
+
+        self.assertEqual(len(discard.discarded), 4)
+        self.assertEqual(batch.num_context_requests, 0)
+        self.assertEqual(batch.batch_size, len(gen))
+        self.assertLessEqual(_forward_tokens(mgr, batch), 16)
+
+    def test_mid_prefill_requests_are_never_unscheduled(self):
+        # Only a first chunk can be retried from scratch for free, and later
+        # chunks are charged exactly (getEstimatedReusableTokens returns 0 for
+        # them), so they are never the reason the batch is over budget.
+        mgr = _make_manager(max_num_tokens=32, tokens_per_block=self.TPB)
+        mid = _FakeRequest(
+            context_chunk_size=2048,
+            prompt_len=4096,
+            context_current_position=2048,
+            prepopulated_prompt_len=0,
+        )
+        fresh = _FakeRequest(context_chunk_size=4096, prompt_len=4096)
+        batch = _make_batch([mid, fresh])
+        discard = _RecordingDiscard()
+
+        self.assertFalse(mid.is_first_context_chunk)
+        mgr.fit_token_budget(batch, discard)
+
+        self.assertEqual(discard.ids, [fresh.py_request_id])
+        self.assertIn(mid, batch.context_requests)
+
+    def test_reuse_hit_request_is_still_a_first_chunk(self):
+        # addSequence advances context_current_position to
+        # prepopulated_prompt_len, which leaves is_first_context_chunk true --
+        # a reuse hit whose estimate was wrong is exactly the population this
+        # tier exists for, so it must remain eligible.
+        mgr = _make_manager(max_num_tokens=32, tokens_per_block=self.TPB)
+        reused = _FakeRequest(
+            context_chunk_size=2048,
+            prompt_len=4096,
+            context_current_position=2048,
+            prepopulated_prompt_len=2048,
+        )
+        # A generation request keeps the batch non-empty once it goes, so the
+        # reuse-hit request is the only thing left to shed.
+        gen = _FakeRequest(context_chunk_size=0, is_last_context_chunk=False)
+        batch = _make_batch([reused], [gen])
+        discard = _RecordingDiscard()
+
+        self.assertTrue(reused.is_first_context_chunk)
+        mgr.fit_token_budget(batch, discard)
+
+        self.assertEqual(discard.ids, [reused.py_request_id])
+
+    def test_disagg_generation_init_requests_are_not_unscheduled(self):
+        # They contribute no compute tokens (nothing to shed) and their KV cache
+        # is being filled by an in-flight transfer.
+        mgr = _make_manager(max_num_tokens=32, tokens_per_block=self.TPB)
+        disagg = _FakeRequest(
+            context_chunk_size=4096,
+            prompt_len=4096,
+            is_disagg_generation_init_state=True,
+        )
+        a = _FakeRequest(context_chunk_size=4096, prompt_len=4096)
+        b = _FakeRequest(context_chunk_size=4096, prompt_len=4096)
+        batch = _make_batch([disagg, a, b])
+        discard = _RecordingDiscard()
+
+        mgr.fit_token_budget(batch, discard)
+
+        self.assertNotIn(disagg.py_request_id, discard.ids)
+        self.assertIn(disagg, batch.context_requests)
+
+    def test_a_kv_connector_blocks_unscheduling(self):
+        # build_scheduler_output has already reported the batch and
+        # update_state_after_alloc has fired; neither has an inverse.
+        mgr = _make_manager(max_num_tokens=128, tokens_per_block=self.TPB)
+        mgr.kv_connector_manager = object()
+        _, _, batch = self._maxed_batch(8)
+        discard = _RecordingDiscard()
+
+        mgr.fit_token_budget(batch, discard)
+
+        self.assertEqual(discard.discarded, [])
+        self.assertEqual(batch.num_context_requests, 8)
+
+    def test_chunked_prefill_disabled_discards_instead_of_shrinking(self):
+        # With chunked prefill off there is no shrink tier at all: a partial
+        # context chunk is not something the attention backend can consume. So
+        # every over-budget token has to come off as whole requests. This is the
+        # configuration in #13318, and doing nothing here is the assert.
+        mgr = _make_manager(
+            max_num_tokens=8192, tokens_per_block=self.TPB, enable_chunked_prefill=False
+        )
+        ctx, _, batch = self._maxed_batch(8, prompt_len=4096)
+        discard = _RecordingDiscard()
+
+        mgr.fit_token_budget(batch, discard)
+
+        # 8 x 4096 against 8192: only two whole requests fit, and no chunk is
+        # touched on the way -- shrinking would have produced a partial chunk.
+        self.assertEqual(len(discard.discarded), 6)
+        self.assertEqual(batch.num_context_requests, 2)
+        self.assertLessEqual(_forward_tokens(mgr, batch), 8192)
+        for req in batch.context_requests:
+            self.assertEqual(req.context_chunk_size, 4096)
+
+    def test_chunked_prefill_disabled_leaves_chunks_untouched_when_it_cannot_fit(self):
+        # The floor of the discard tier is one request. With chunked prefill off
+        # that request cannot then be shrunk either, so the batch stays over
+        # budget -- reported, and with its chunk intact rather than made partial.
+        mgr = _make_manager(
+            max_num_tokens=1024, tokens_per_block=self.TPB, enable_chunked_prefill=False
+        )
+        ctx, _, batch = self._maxed_batch(3, prompt_len=4096)
+        discard = _RecordingDiscard()
+
+        unfittable = mgr.fit_token_budget(batch, discard)
+
+        self.assertEqual(len(discard.discarded), 2)
+        self.assertEqual(batch.batch_size, 1)
+        self.assertEqual(batch.context_requests[0].context_chunk_size, 4096)
+        self.assertGreater(_forward_tokens(mgr, batch), 1024)
+        # No batch can ever hold what is left, so it is reported for failure
+        # rather than retried forever.
+        self.assertEqual(unfittable, [batch.context_requests[0]])
+
+
+class TestUnfittableRequestsAreReported(unittest.TestCase):
+    """The terminal tier: a request no batch can ever hold.
+
+    Shrinking and unscheduling both bottom out at "one request must stay in the
+    batch", because the attention-DP _can_queue vote was taken before
+    prepare_resources and emptying the batch after it leaves peers blocked in a
+    collective this rank never enters. If that last request costs more than the
+    whole budget it can never run: retrying rebuilds this same batch forever and
+    running it trips the _prepare_tp_inputs assert. fit_token_budget reports it
+    so the executor can fail it against the client.
+    """
+
+    TPB = 32
+
+    def test_nothing_reported_when_the_batch_fits(self):
+        mgr = _make_manager(max_num_tokens=8192, tokens_per_block=self.TPB)
+        batch = _make_batch([_FakeRequest(context_chunk_size=64, prompt_len=64)])
+
+        self.assertEqual(mgr.fit_token_budget(batch, _RecordingDiscard()), [])
+
+    def test_nothing_reported_when_shrinking_rescued_the_batch(self):
+        mgr = _make_manager(max_num_tokens=1024, tokens_per_block=self.TPB)
+        ctx = [_FakeRequest(context_chunk_size=4096, prompt_len=4096) for _ in range(2)]
+        batch = _make_batch(ctx)
+
+        self.assertEqual(mgr.fit_token_budget(batch, _RecordingDiscard()), [])
+        self.assertLessEqual(_forward_tokens(mgr, batch), 1024)
+
+    def test_a_request_that_fits_alone_is_never_reported(self):
+        # The batch is over budget only because of the other requests; the
+        # survivor is viable, so it is retried rather than failed.
+        mgr = _make_manager(
+            max_num_tokens=4096, tokens_per_block=self.TPB, enable_chunked_prefill=False
+        )
+        ctx = [_FakeRequest(context_chunk_size=4096, prompt_len=4096) for _ in range(3)]
+        batch = _make_batch(ctx)
+
+        unfittable = mgr.fit_token_budget(batch, _RecordingDiscard())
+
+        self.assertEqual(batch.batch_size, 1)
+        self.assertEqual(_forward_tokens(mgr, batch), 4096)
+        self.assertEqual(unfittable, [])
+
+    def test_generation_overshoot_does_not_report_a_context_request(self):
+        # Generation requests cannot be shed at all, so an over-budget batch of
+        # them is a configuration problem (README F4), not a request that can be
+        # blamed and failed.
+        mgr = _make_manager(max_num_tokens=64, tokens_per_block=self.TPB)
+        gen = [_FakeRequest(py_beam_width=100) for _ in range(2)]
+        batch = _make_batch([_FakeRequest(context_chunk_size=32, prompt_len=32)], gen)
+
+        unfittable = mgr.fit_token_budget(batch, _RecordingDiscard())
+
+        self.assertEqual(unfittable, [])
+
+    def test_shrink_only_callers_still_get_a_report(self):
+        # A caller with no discard callback (Part 2 behaviour) still learns that
+        # the batch cannot be fitted.
+        mgr = _make_manager(
+            max_num_tokens=1024, tokens_per_block=self.TPB, enable_chunked_prefill=False
+        )
+        req = _FakeRequest(context_chunk_size=4096, prompt_len=4096)
+        batch = _make_batch([req])
+
+        self.assertEqual(mgr.fit_token_budget(batch), [req])
+
+
+class TestDiscardRequestUnwind(unittest.TestCase):
+    """What ``discard_request`` has to undo for the retry to be correct."""
+
+    class _FakeImpl:
+        def __init__(self):
+            self.removed = []
+
+        def remove_sequence(self, request_id, llm_request, pin_on_release):
+            # The C++ side reads the cursor *during* the call to decide how much
+            # to store for reuse, so record it as it stands here.
+            self.removed.append(
+                (request_id, llm_request, pin_on_release, llm_request.context_current_position)
+            )
+
+    def _manager(self):
+        mgr = _make_manager(max_num_tokens=128, tokens_per_block=32)
+        mgr.impl = self._FakeImpl()
+        return mgr
+
+    def test_blocks_are_released_without_being_stored_for_reuse(self):
+        # releaseBlocks stores min(num_tokens, context_current_position) - 1
+        # tokens' worth of blocks in the reuse trie, and at position 0 its
+        # legacy fallback stores num_tokens - 1 instead. This request has not
+        # run a forward pass, so either would publish uninitialized blocks as
+        # reusable. Position 1 stores nothing (usable count 0) and keeps the
+        # fallback's position == 0 guard false.
+        mgr = self._manager()
+        req = _FakeRequest(context_chunk_size=4096, prompt_len=4096)
+
+        mgr.discard_request(req)
+
+        self.assertEqual(len(mgr.impl.removed), 1)
+        request_id, _, pin_on_release, position_at_call = mgr.impl.removed[0]
+        self.assertEqual(request_id, req.py_request_id)
+        self.assertEqual(position_at_call, 1)
+        self.assertFalse(pin_on_release)
+
+    def test_a_reuse_hit_is_also_removed_at_the_no_store_position(self):
+        # Removing at the real position (prepopulated_prompt_len) would re-store
+        # a prefix that is already in the trie; only the no-store position is
+        # used, whatever the request came in with.
+        mgr = self._manager()
+        req = _FakeRequest(
+            context_chunk_size=2048,
+            prompt_len=4096,
+            context_current_position=2048,
+            prepopulated_prompt_len=2048,
+        )
+
+        mgr.discard_request(req)
+
+        self.assertEqual(mgr.impl.removed[0][3], 1)
+
+    def test_cursor_is_rewound_so_the_retry_re_enters_add_sequence(self):
+        # addSequence advanced the position to prepopulated_prompt_len. Left
+        # there once the blocks are gone, the next addSequence -- which only
+        # moves the position for a non-zero reuse hit -- would skip recomputing
+        # a prefix that no longer has KV cache behind it.
+        mgr = self._manager()
+        req = _FakeRequest(
+            context_chunk_size=2048,
+            prompt_len=4096,
+            context_current_position=2048,
+            prepopulated_prompt_len=2048,
+        )
+
+        mgr.discard_request(req)
+
+        self.assertEqual(req.context_current_position, 0)
+        self.assertEqual(req.prepopulated_prompt_len, 0)
+        # The whole prompt, matching LlmRequest::pause's reset. A zero chunk
+        # makes the next setPrepopulatedPromptLen compute a *negative* chunk
+        # size wherever nothing re-chunks the request first -- which is every
+        # request when chunked prefill is disabled.
+        self.assertEqual(req.context_chunk_size, req.prompt_len)
+        self.assertEqual(req.estimated_reusable_tokens, 0)
+        # A fresh arrival again: the retry allocates from scratch.
+        self.assertTrue(req.is_first_context_chunk)
+
+
+class TestResourceManagerDiscard(unittest.TestCase):
+    """Every manager must get the chance to undo, not just the KV cache one."""
+
+    class _Recorder:
+        def __init__(self, log, name):
+            self._log = log
+            self._name = name
+
+        def discard_request(self, request):
+            self._log.append(self._name)
+
+    def test_all_managers_are_unwound_in_reverse_order(self):
+        # Mirrors free_resources: a manager's undo runs before that of the
+        # manager it was prepared after. Eagle3 / MTP allocate a slot per
+        # first-context-chunk request and SlotManager.add_slot asserts on a
+        # duplicate id, so skipping them would abort the loop on the retry.
+        log = []
+        rm = ResourceManager(
+            OrderedDict(
+                [
+                    (ResourceManagerType.KV_CACHE_MANAGER, self._Recorder(log, "kv")),
+                    (ResourceManagerType.SPEC_RESOURCE_MANAGER, self._Recorder(log, "spec")),
+                    (ResourceManagerType.SEQ_SLOT_MANAGER, self._Recorder(log, "slot")),
+                ]
+            )
+        )
+
+        rm.discard_request(_FakeRequest())
+
+        self.assertEqual(log, ["slot", "spec", "kv"])
+
+    def test_managers_without_an_undo_are_skipped(self):
+        rm = ResourceManager(OrderedDict([(ResourceManagerType.SEQ_SLOT_MANAGER, object())]))
+        rm.discard_request(_FakeRequest())  # must not raise
+
+
+class TestConnectorIsToldTheTrimmedBatch(unittest.TestCase):
     """The KV connector must see the batch that will actually run.
 
     RequestData.num_scheduled_tokens is documented as "the number of scheduled
@@ -530,10 +977,11 @@ class TestConnectorSeesTheTrimmedBatch(unittest.TestCase):
         def prepare_resources(self, scheduled_batch):
             self._log.append(("prepare", self._chunks()))
 
-        def maybe_fit_token_budget(self, scheduled_batch):
+        def maybe_fit_token_budget(self, scheduled_batch, discard=None):
             for req in scheduled_batch.context_requests:
                 req.context_chunk_size = self._shrink_to
             self._log.append(("trim", self._chunks()))
+            return []
 
         def publish_connector_scheduler_output(self, scheduled_batch):
             self._log.append(("publish", self._chunks()))
@@ -566,7 +1014,7 @@ class TestConnectorSeesTheTrimmedBatch(unittest.TestCase):
 
     def test_managers_without_a_connector_hook_are_skipped(self):
         rm = ResourceManager(OrderedDict([(ResourceManagerType.KV_CACHE_MANAGER, object())]))
-        rm.prepare_resources(_make_batch())  # must not raise
+        self.assertEqual(rm.prepare_resources(_make_batch()), [])  # must not raise
 
     def test_publishing_is_a_no_op_without_a_connector(self):
         mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
@@ -588,6 +1036,101 @@ class TestConnectorSeesTheTrimmedBatch(unittest.TestCase):
         mgr.publish_connector_scheduler_output(batch)
 
         self.assertEqual(mgr.kv_connector_manager.calls, [(batch, mgr)])
+
+
+class TestFailUnfittableRequests(unittest.TestCase):
+    """PyExecutor._fail_unfittable_requests, including its ADP safety.
+
+    The decision is rank-local but _handle_errors reaches _enqueue_responses,
+    whose tp_gather deadlocks unless every rank enters it. So the ranks agree on
+    a boolean first and then all of them call _handle_errors -- the same shape
+    as _handle_disagg_cache_errors_synced.
+    """
+
+    class _FakeDist:
+        def __init__(self, world_size=2, peer_says_yes=False):
+            self.world_size = world_size
+            self.peer_says_yes = peer_says_yes
+            self.allgather_calls = 0
+
+        def tp_allgather(self, value):
+            self.allgather_calls += 1
+            return [value, self.peer_says_yes]
+
+    def _executor(self, *, attention_dp=False, world_size=1, peer_says_yes=False):
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+        executor = PyExecutor.__new__(PyExecutor)
+        executor.enable_attention_dp = attention_dp
+        executor.dist = self._FakeDist(world_size, peer_says_yes)
+        executor.handled = []
+        executor._handle_errors = lambda msg, requests=None, charge_budget=True: (
+            executor.handled.append((msg, list(requests or []), charge_budget))
+        )
+        return executor
+
+    def test_no_unfittable_requests_is_a_no_op(self):
+        executor = self._executor()
+        batch = _make_batch([_FakeRequest(context_chunk_size=32, prompt_len=32)])
+
+        self.assertFalse(executor._fail_unfittable_requests(batch, []))
+        self.assertEqual(executor.handled, [])
+        self.assertEqual(batch.num_context_requests, 1)
+
+    def test_failing_removes_the_request_from_the_batch(self):
+        # It is being terminated, so the forward pass must not still see it.
+        executor = self._executor()
+        doomed = _FakeRequest(context_chunk_size=4096, prompt_len=4096)
+        batch = _make_batch([doomed])
+
+        self.assertTrue(executor._fail_unfittable_requests(batch, [doomed]))
+
+        self.assertEqual(batch.num_context_requests, 0)
+        self.assertEqual(len(executor.handled), 1)
+        _, requests, charge_budget = executor.handled[0]
+        self.assertEqual(requests, [doomed])
+        # A request the caller sent that this engine cannot serve is not an
+        # engine health problem, so it must not consume the error budget.
+        self.assertFalse(charge_budget)
+
+    def test_no_collective_without_attention_dp(self):
+        executor = self._executor(attention_dp=False, world_size=8)
+        doomed = _FakeRequest(context_chunk_size=4096, prompt_len=4096)
+
+        executor._fail_unfittable_requests(_make_batch([doomed]), [doomed])
+
+        self.assertEqual(executor.dist.allgather_calls, 0)
+
+    def test_all_ranks_enter_handle_errors_when_a_peer_has_one(self):
+        # This rank has nothing to fail, but a peer does. It must still call
+        # _handle_errors -- with an empty list -- so both ranks enter the
+        # tp_gather inside _enqueue_responses.
+        executor = self._executor(attention_dp=True, world_size=2, peer_says_yes=True)
+        batch = _make_batch([_FakeRequest(context_chunk_size=32, prompt_len=32)])
+
+        self.assertTrue(executor._fail_unfittable_requests(batch, []))
+
+        self.assertEqual(executor.dist.allgather_calls, 1)
+        self.assertEqual(len(executor.handled), 1)
+        self.assertEqual(executor.handled[0][1], [])
+        # Nothing of this rank's own was removed.
+        self.assertEqual(batch.num_context_requests, 1)
+
+    def test_ranks_agree_when_nobody_has_one(self):
+        executor = self._executor(attention_dp=True, world_size=2, peer_says_yes=False)
+
+        self.assertFalse(executor._fail_unfittable_requests(_make_batch(), []))
+        self.assertEqual(executor.dist.allgather_calls, 1)
+        self.assertEqual(executor.handled, [])
+
+    def test_single_rank_needs_no_agreement(self):
+        # world_size == 1 has no peers, so no collective is entered.
+        executor = self._executor(attention_dp=True, world_size=1)
+        doomed = _FakeRequest(context_chunk_size=4096, prompt_len=4096)
+
+        self.assertTrue(executor._fail_unfittable_requests(_make_batch([doomed]), [doomed]))
+        self.assertEqual(executor.dist.allgather_calls, 0)
+        self.assertEqual(len(executor.handled), 1)
 
 
 if __name__ == "__main__":
