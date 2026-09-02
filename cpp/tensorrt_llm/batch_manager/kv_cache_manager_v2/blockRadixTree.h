@@ -188,7 +188,8 @@ struct NodeBase
     SharedPtr<Block> detachNext(BlockKey const& key);
 
     /// RootBlock: delegates to tree. Block: len(prev->tokens) or prev->tokensPerBlock().
-    virtual int tokensPerBlock() const noexcept = 0;
+    /// Throws if called on an orphan Block (prev == nullptr); hence not noexcept.
+    virtual int tokensPerBlock() const = 0;
 
     /// Tree-wide life-cycle count. RootBlock: delegates to tree. Block: storage.size().
     /// Mirrors Python's num_life_cycles property.
@@ -226,7 +227,7 @@ struct RootBlock : NodeBase
         return kBadBlockOrdinal;
     }
 
-    int tokensPerBlock() const noexcept override;
+    int tokensPerBlock() const override;
     LifeCycleId numLifeCycles() const noexcept override; // delegates to tree
 };
 
@@ -266,14 +267,14 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
         return mOrdinal;
     }
 
-    int tokensPerBlock() const noexcept override;
+    int tokensPerBlock() const override;
 
     LifeCycleId numLifeCycles() const noexcept override
     {
         return storage.size();
     }
 
-    bool isFull() const noexcept
+    bool isFull() const
     {
         return static_cast<int>(tokens.size()) == tokensPerBlock();
     }

@@ -232,7 +232,7 @@ RootBlock::RootBlock(ReuseScope reuseScope_, BlockRadixTree* treePtr)
 {
 }
 
-int RootBlock::tokensPerBlock() const noexcept
+int RootBlock::tokensPerBlock() const
 {
     return tree->tokensPerBlock();
 }
@@ -333,9 +333,14 @@ LifeCycleId RootBlock::numLifeCycles() const noexcept
     return tree->numLifeCycles();
 }
 
-int Block::tokensPerBlock() const noexcept
+int Block::tokensPerBlock() const
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(prev, "Block must have a prev");
+    // Reachable in release builds: an eviction can prune this block while a live KvCache still
+    // holds it, which AGENTS.md documents as a legal state. So this is a real precondition, not
+    // a debug aid -- TLLM_CHECK_DEBUG is inert unless TLLM_DEBUG_MODE=1 and left this as a raw
+    // null dereference in the shipped build (issue 17926). Matches how EventManager already
+    // treats the same condition ("Cannot hash an orphan KV cache block").
+    TLLM_CHECK_WITH_INFO(prev != nullptr, "Block::tokensPerBlock() called on an orphan block");
     // Mirrors Python: prev.tokens_per_block if isinstance(prev, RootBlock) else len(prev.tokens)
     if (prev->type() == Type::kROOT_BLOCK)
         return prev->tokensPerBlock();
@@ -503,12 +508,18 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
 
 SharedPtr<Block> addOrGetExistingBlock(NodeBase* prev, std::vector<TokenIdExt> tokens, bool knownNoDigest, bool* isNew)
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(prev, "prev must not be null");
+    TLLM_CHECK_WITH_INFO(prev != nullptr, "addOrGetExistingBlock: prev must not be null");
 
     // Prev must be a full block if it is a Block (mirrors Python: "prev must be a full block").
     if (prev->type() == NodeBase::Type::kBLOCK)
     {
-        TLLM_CHECK_DEBUG_WITH_INFO(static_cast<Block*>(prev)->isFull(), "prev must be a full block");
+        auto const* prevBlock = static_cast<Block const*>(prev);
+        // Order matters: isFull() -> tokensPerBlock() -> prev->prev, so the orphan test must run
+        // first or the diagnostic faults before it can report anything.
+        TLLM_CHECK_WITH_INFO(!prevBlock->isOrphan(),
+            "addOrGetExistingBlock: prev block (ordinal %d) is detached from the radix tree",
+            static_cast<int>(prevBlock->ordinal().value()));
+        TLLM_CHECK_DEBUG_WITH_INFO(prevBlock->isFull(), "prev must be a full block");
     }
 
     auto& prevNext = prev->next;

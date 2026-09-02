@@ -25,6 +25,7 @@
 #include "kv_cache_manager_v2/utils/math.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include <algorithm>
 #include <stdexcept>
 #include <unordered_set>
@@ -1498,6 +1499,38 @@ TypedVec<LifeCycleId, KvCache::TakenPage> KvCache::_takeUncommittedPage(
 }
 
 // ---------------------------------------------------------------------------
+// Orphaned-prefix handling — see issue 17926.
+// ---------------------------------------------------------------------------
+
+bool KvCache::_prevCommittedBlockIsOrphan(int ordinal) const
+{
+    if (ordinal <= 0)
+    {
+        return false; // ordinal 0 commits onto the root, which is never detached
+    }
+    auto const& prevTreeBlock = mBlocks[BlockOrdinal{ordinal - 1}].treeBlock;
+    return prevTreeBlock && prevTreeBlock->isOrphan();
+}
+
+void KvCache::_stopContributingToReuseTree(bool isLast)
+{
+    // VIRTUAL_STOP, not USER_STOP. The orphan appears in the middle of a chunked prefill
+    // (measured on the issue's repro: ordinal 692 of ~4000, isEnd=0), and USER_STOP makes the
+    // *next* commit() call throw "Cannot commit tokens after stop_committing()". VIRTUAL_STOP is
+    // the state commit() is built to absorb: it keeps appending tokens, returns early, and
+    // promotes to USER_STOP at isEnd -- so the request completes.
+    mCommitState = CommitState::VIRTUAL_STOP;
+    if (isLast)
+    {
+        // Mirrors the tail of _commitBlock: the last commit of a sequence has nothing left to
+        // contribute, and leaving it in VIRTUAL_STOP would skip _onStopCommitting() and break
+        // stopCommitting()'s postcondition.
+        mCommitState = CommitState::USER_STOP;
+        _onStopCommitting();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // _commitBlock — shared logic for committing a single block.
 // Mirrors Python's _commit_block(ordinal, is_last).
 // Caller must have recordEventScope() open so finishEvent() works.
@@ -1534,6 +1567,23 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
     if (ord > 0)
     {
         TLLM_CHECK_DEBUG_WITH_INFO(mBlocks[BlockOrdinal{ord - 1}].treeBlock, "prev block must be committed");
+        // The block we committed on the previous iteration can have been detached from the tree
+        // since: committing it may allocate an SSM snapshot page, and that allocation can evict,
+        // which runs Block::clearStaleBlocksAfterPageUnlink re-entrantly and can prune this very
+        // block (issue 17926). A live KvCache holding an orphan is legal (see AGENTS.md), so this
+        // is not an error -- but the prefix is no longer in the reuse tree, so there is nothing to
+        // commit onto. Take the same exit as the "can't commit and can't reuse" branch below: the
+        // sequence stops contributing to the reuse tree and completes normally, losing reuse
+        // benefit but not correctness.
+        if (_prevCommittedBlockIsOrphan(ord))
+        {
+            TLLM_LOG_DEBUG(
+                "KvCache::_commitBlock: prev block (ordinal %d) was detached from the radix tree by a "
+                "re-entrant eviction; this sequence stops contributing to the reuse tree.",
+                ord - 1);
+            _stopContributingToReuseTree(isLast);
+            return;
+        }
         prevNode = mBlocks[BlockOrdinal{ord - 1}].treeBlock.get();
     }
 
@@ -1552,6 +1602,15 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
         blockIsNew = false;
     }
     TLLM_CHECK_DEBUG(newBlock);
+    // newBlock may be the sibling handed back by UselessBlockError, which is not guaranteed to be
+    // attached to the tree. Everything below -- the debug check, isFull(), the rebase branch --
+    // reads its `prev`, which is null on an orphan (issue 17926). There is nothing to commit onto
+    // a detached block, so take the same exit as the orphaned-prev case above.
+    if (newBlock->isOrphan())
+    {
+        _stopContributingToReuseTree(isLast);
+        return;
+    }
     TLLM_CHECK_DEBUG(newBlock->tokensPerBlock() == mTokensPerBlock);
     // In reuse case, verify token match (mirrors Python: tree_block.tokens[:num_tokens] == tokens).
     TLLM_CHECK_DEBUG(blockIsNew || std::equal(tokenBlock.begin(), tokenBlock.end(), newBlock->tokens.begin()));
@@ -1753,18 +1812,23 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
 
     // Append tokens to committed list.
     mCommittedTokens.insert(mCommittedTokens.end(), tokens.begin(), tokens.end());
+
+    // Bump history_length to cover newly committed tokens (mirrors Python — done
+    // BEFORE the commit loop so stale-range computation sees the new history).
+    // This must also happen under VIRTUAL_STOP: that state means "stop contributing to the reuse
+    // tree", not "stop tracking the sequence". Returning before this bump freezes mHistoryLength
+    // while mCommittedTokens keeps growing, so the next call trips commit_min_snapshot's
+    // "start or end at history_length" assertion (issue 17926).
+    int const numCommitted = static_cast<int>(mCommittedTokens.size());
+    if (mHistoryLength < numCommitted)
+        setHistoryLength(numCommitted);
+
     if (mCommitState == CommitState::VIRTUAL_STOP)
     {
         if (isEnd)
             mCommitState = CommitState::USER_STOP;
         return;
     }
-
-    // Bump history_length to cover newly committed tokens (mirrors Python — done
-    // BEFORE the commit loop so stale-range computation sees the new history).
-    int const numCommitted = static_cast<int>(mCommittedTokens.size());
-    if (mHistoryLength < numCommitted)
-        setHistoryLength(numCommitted);
 
     int const numCommittedBlocksBefore = mNumCommittedBlocks;
     int const newNumFullBlocks = numCommitted / mTokensPerBlock;
@@ -1792,6 +1856,15 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
             {
                 _commitBlock(newNumFullBlocks, /*isLast=*/true, /*commitSsm=*/ssmLcId.has_value(),
                     /*moveSsm=*/ssmLcId.has_value());
+            }
+            else if (_prevCommittedBlockIsOrphan(newNumFullBlocks))
+            {
+                // Same detached prefix as in _commitBlock, reached by the other route: a chunk
+                // that ends mid-block snapshots the partial block onto the previous one instead
+                // of committing (issue 17926). Without this the throw from
+                // addOrGetExistingBlock() escapes commit() and fails the request -- the issue's
+                // own 256k prompt only missed it by being block-aligned.
+                _stopContributingToReuseTree(/*isLast=*/false);
             }
             else
             {

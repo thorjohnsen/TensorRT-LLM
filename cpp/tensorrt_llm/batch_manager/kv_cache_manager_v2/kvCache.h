@@ -449,6 +449,16 @@ private:
     // Snapshot a partial (non-full) final block at `ordinal` into the radix tree,
     // copying partial attention pages and optionally the SSM snapshot.
     void _snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm);
+
+    // True when the block committed at `ordinal - 1` has been detached from the radix tree
+    // since it was committed (issue 17926). Ordinal 0 commits onto the root, which is never
+    // detached, so it is never orphaned.
+    bool _prevCommittedBlockIsOrphan(int ordinal) const;
+
+    // Stop contributing to the reuse tree while the sequence keeps running (issue 17926).
+    // `isLast` mirrors the tail of _commitBlock(): the final commit of a sequence has nothing
+    // more to contribute, so it goes straight to USER_STOP and runs the stop-committing hook.
+    void _stopContributingToReuseTree(bool isLast);
     // Returns [stale_begin, stale_end) block ordinal range for a SWA lifecycle.
     HalfOpenRange<BlockOrdinal> _getStaleRange(int historyLength, LifeCycle const& lc) const;
 
