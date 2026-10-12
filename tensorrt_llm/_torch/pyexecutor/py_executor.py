@@ -5521,6 +5521,7 @@ class PyExecutor:
                 paused.append(req)
         paused_dummies = self._suspend_padding_dummies_for_rebalance(mgr)
         _t1 = time.perf_counter()
+        _levels_before = self._nvbug6900756_levels(mgr)
 
         try:
             mgr.impl.adjust()
@@ -5563,7 +5564,20 @@ class PyExecutor:
             f"resume_failed={_resume_failed} "
             f"cuda_free_gib={cuda_free / 2**30:.2f}/{cuda_total / 2**30:.2f} "
             f"before={_stats_before} "
-            f"after={self._nvbug6900756_pool_stats(mgr)}")
+            f"after={self._nvbug6900756_pool_stats(mgr)} "
+            f"levels_before={_levels_before} "
+            f"levels_after={self._nvbug6900756_levels(mgr)}")
+
+    @staticmethod
+    def _nvbug6900756_levels(mgr) -> str:
+        """Per cache level: need flag, current ratio, target ratio."""
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import _cpp_introspection
+        parts = []
+        for lvl, (cur, tgt, need) in enumerate(
+                _cpp_introspection.level_rebalance_state(mgr.impl)):
+            fmt = lambda v: "[" + ",".join(f"{x:.4f}" for x in v) + "]"
+            parts.append(f"L{lvl}:need={int(need)}:cur={fmt(cur)}:tgt={fmt(tgt)}")
+        return "{" + " ".join(parts) + "}"
 
     @staticmethod
     def _nvbug6900756_pool_stats(mgr) -> str:
