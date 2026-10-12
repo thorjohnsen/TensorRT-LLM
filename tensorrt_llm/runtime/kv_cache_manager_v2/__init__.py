@@ -129,6 +129,7 @@ class _KVCacheManagerConfigFieldSpec:
     enable_stats: bool = True
     text_only: bool = False
     enable_partial_commit: bool = True
+    pool_rebalance: object = None
 
 
 KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
@@ -153,6 +154,7 @@ PoolDesc = _cpp.PoolDesc
 PoolGroupDesc = _cpp.PoolGroupDesc
 PoolGroupPeakBlockStats = _cpp.PoolGroupPeakBlockStats
 ReuseGroupStatus = _cpp.ReuseGroupStatus
+PoolRebalanceConfig = _cpp.PoolRebalanceConfig
 ReuseScope = _cpp.ReuseScope
 ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
 ScratchDesc = _cpp.ScratchDesc
@@ -271,6 +273,7 @@ __all__ = [
     "SlidingWindowSize",
     "SlotDesc",
     "SlotDescVariant",
+    "PoolRebalanceConfig",
     "SsmLayerConfig",
     "StreamingBlockRemovedData",
     "StreamingBlockStoredData",
