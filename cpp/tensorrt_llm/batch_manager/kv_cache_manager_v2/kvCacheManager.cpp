@@ -1059,6 +1059,9 @@ bool KvCacheManager::needAdjustment() const
     return _needAdjustment(kHotLevel) || _needAdjustment(lastLevel);
 }
 
+// Experiment-only (nvbug 6900756): wall seconds spent in _adjustLevel per level by the last adjust().
+std::vector<double> gNvbug6900756AdjustLevelSeconds;
+
 void KvCacheManager::adjust()
 {
     KVCM2_API_GUARD();
@@ -1069,10 +1072,15 @@ void KvCacheManager::adjust()
             "defragment, which relocates pages and invalidates indices an ACTIVE cache holds");
 
     CacheLevel numLevels = mStorage->numCacheLevels();
+    gNvbug6900756AdjustLevelSeconds.assign(numLevels.value(), 0.0);
     for (CacheLevel level{0}; level < numLevels; ++level)
     {
         if (_needAdjustment(level))
+        {
+            double const start = nowSeconds();
             _adjustLevel(level, getQuota(level));
+            gNvbug6900756AdjustLevelSeconds[level.value()] = nowSeconds() - start;
+        }
     }
     mLastAdjustmentTime = nowSeconds();
 }

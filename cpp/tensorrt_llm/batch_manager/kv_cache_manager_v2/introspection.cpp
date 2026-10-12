@@ -131,6 +131,13 @@ void KvCacheIntrospection::setTargetRatioListGpu(KvCacheManager& manager, TypedV
     manager.mTargetRatioListHot = std::move(value);
 }
 
+extern std::vector<double> gNvbug6900756AdjustLevelSeconds;
+
+std::vector<double> KvCacheIntrospection::lastAdjustLevelSeconds()
+{
+    return gNvbug6900756AdjustLevelSeconds;
+}
+
 std::vector<std::tuple<std::vector<float>, std::vector<float>, bool>> KvCacheIntrospection::levelRebalanceState(
     KvCacheManager const& manager)
 {

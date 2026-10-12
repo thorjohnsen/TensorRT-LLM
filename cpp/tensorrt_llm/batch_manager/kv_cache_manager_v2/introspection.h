@@ -56,6 +56,8 @@ public:
     // Per cache level: (current ratio, target ratio, needs adjustment), as adjust() computes them.
     static std::vector<std::tuple<std::vector<float>, std::vector<float>, bool>> levelRebalanceState(
         KvCacheManager const& manager);
+    // Seconds spent per level by the last adjust() (0 for levels it skipped).
+    static std::vector<double> lastAdjustLevelSeconds();
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
