@@ -131,4 +131,20 @@ void KvCacheIntrospection::setTargetRatioListGpu(KvCacheManager& manager, TypedV
     manager.mTargetRatioListHot = std::move(value);
 }
 
+std::vector<std::tuple<std::vector<float>, std::vector<float>, bool>> KvCacheIntrospection::levelRebalanceState(
+    KvCacheManager const& manager)
+{
+    auto const apiLock = manager.lockShared();
+    std::vector<std::tuple<std::vector<float>, std::vector<float>, bool>> out;
+    CacheLevel const numLevels = manager.mStorage->numCacheLevels();
+    for (CacheLevel level{0}; level < numLevels; ++level)
+    {
+        auto current = (level == kHotLevel) ? manager._currentHotRatio() : manager._currentColdRatios();
+        auto const& target = manager._getTargetRatioList(level);
+        out.emplace_back(std::vector<float>(current.raw().begin(), current.raw().end()),
+            std::vector<float>(target.raw().begin(), target.raw().end()), manager._needAdjustment(level));
+    }
+    return out;
+}
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

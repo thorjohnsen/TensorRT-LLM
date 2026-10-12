@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <optional>
 #include <tuple>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -52,6 +53,9 @@ public:
     static void setNumSampledKvCaches(KvCacheManager& manager, int value);
     static void setLastAdjustmentTime(KvCacheManager& manager, double value);
     static void setTargetRatioListGpu(KvCacheManager& manager, TypedVec<PoolGroupIndex, float> value);
+    // Per cache level: (current ratio, target ratio, needs adjustment), as adjust() computes them.
+    static std::vector<std::tuple<std::vector<float>, std::vector<float>, bool>> levelRebalanceState(
+        KvCacheManager const& manager);
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
