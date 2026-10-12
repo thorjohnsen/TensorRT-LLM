@@ -5287,11 +5287,15 @@ class PyExecutor:
         inline and instead drains its microbatch ring first, then calls
         ``_rebalance_kv_pools_now`` directly.
         """
+        t0 = time.perf_counter()
         if not self._agreed_need_adjustment():
             return
-
+        t1 = time.perf_counter()
         torch.cuda.current_stream().synchronize()
+        t2 = time.perf_counter()
         self._consume_previous_batch_for_rebalance()
+        t3 = time.perf_counter()
+        self._nvbug6900756_pre = (t1 - t0, t2 - t1, t3 - t2)
         self._rebalance_kv_pools_now()
 
     def _rebalance_kv_pools_now(self) -> None:
@@ -5302,6 +5306,9 @@ class PyExecutor:
         underneath whatever holds them.
         """
         mgr = self.kv_cache_manager
+        _wall0 = time.time()
+        _t0 = time.perf_counter()
+        _stats_before = self._nvbug6900756_pool_stats(mgr)
 
         paused: List[LlmRequest] = []
         for req in self.active_requests:
@@ -5309,11 +5316,13 @@ class PyExecutor:
                 mgr.suspend_request(req)
                 paused.append(req)
         paused_dummies = self._suspend_padding_dummies_for_rebalance(mgr)
+        _t1 = time.perf_counter()
 
         try:
             mgr.impl.adjust()
         except OutOfPagesError as e:
             logger.warning(f"KV pool adjust() failed: {e!r}")
+        _t2 = time.perf_counter()
 
         remote_tail_adp = getattr(self, "_enable_remote_tail_adp", False)
         if remote_tail_adp:
@@ -5328,10 +5337,40 @@ class PyExecutor:
                 raise RuntimeError(
                     "KV pool rebalance could not preserve the reserved "
                     "conditional attention-DP execution row on every rank")
+        _resume_failed = 0
         for req in paused:
-            mgr.resume_request(req)
+            if not mgr.resume_request(req):
+                _resume_failed += 1
         if not remote_tail_adp:
             self._resume_padding_dummies_after_rebalance(mgr, paused_dummies)
+        _t3 = time.perf_counter()
+        self._nvbug6900756_count = getattr(self, "_nvbug6900756_count", 0) + 1
+        pre = getattr(self, "_nvbug6900756_pre", (0.0, 0.0, 0.0))
+        self._nvbug6900756_pre = (0.0, 0.0, 0.0)
+        cuda_free, cuda_total = torch.cuda.mem_get_info()
+        logger.info(
+            f"[nvbug6900756-rebalance] n={self._nvbug6900756_count} "
+            f"rank={self.dist.rank} iter={self.iter_counter} "
+            f"wall_start={_wall0:.3f} wall_end={time.time():.3f} "
+            f"agree={pre[0]:.4f}s sync={pre[1]:.4f}s "
+            f"consume_prev={pre[2]:.4f}s suspend={_t1 - _t0:.4f}s "
+            f"adjust={_t2 - _t1:.4f}s resume={_t3 - _t2:.4f}s "
+            f"paused={len(paused)} dummies={len(paused_dummies)} "
+            f"resume_failed={_resume_failed} "
+            f"cuda_free_gib={cuda_free / 2**30:.2f}/{cuda_total / 2**30:.2f} "
+            f"before={_stats_before} "
+            f"after={self._nvbug6900756_pool_stats(mgr)}")
+
+    @staticmethod
+    def _nvbug6900756_pool_stats(mgr) -> str:
+        """Per GPU pool group: slots total/free/evictable and share of bytes."""
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL
+        stats = mgr.impl.get_storage_statistics(GPU_LEVEL)
+        nbytes = [st.total * sum(st.slot_sizes) for st in stats]
+        total = sum(nbytes) or 1
+        return "[" + ", ".join(
+            f"g{i}:{st.total}/{st.free}/{st.evictable}:{b / total:.4f}"
+            for i, (st, b) in enumerate(zip(stats, nbytes))) + "]"
 
     def _start_pp_rebalance_drain(self) -> None:
         """Begin emptying the microbatch ring ahead of a PP rebalance.
