@@ -1543,6 +1543,16 @@ class Indexer(nn.Module):
         indexer_topk_prefill kernel); the torch topk fallback scans the full
         padded row and needs the fill.
         """
+        _nvbug_bytes = 4 * q_fp8.shape[0] * k_fp8.shape[0]
+        if _nvbug_bytes >= 1 << 30:
+            import time as _time
+
+            _free, _ = torch.cuda.mem_get_info()
+            logger.info(
+                f"[nvbug6900756-logits] wall={_time.time():.3f} "
+                f"q={q_fp8.shape[0]} kv={k_fp8.shape[0]} "
+                f"gib={_nvbug_bytes / 2**30:.2f} free_gib={_free / 2**30:.2f}"
+            )
         if self.use_fp4:
             k_fp4_bytes = k_fp8.view(torch.int8)
             if q_scale is None:
