@@ -20,6 +20,8 @@
 #include "kv_cache_manager_v2/common.h"
 
 #include <cstddef>
+#include <utility>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -44,13 +46,19 @@ public:
     static constexpr size_t kChunkSize = 2ULL << 30;           // 2 GB
     static constexpr size_t kPrefaultChunkSize = 512ULL << 20; // 512 MB
 
-    explicit HostMem(size_t size);
+    //! @param size       Initial size in bytes (multiple of kAlignment).
+    //! @param alignHint  Registration extents never split a multiple of this (e.g. a slot size), so a copy of one
+    //!                   slot never crosses a registered region.
+    //! @param maxSize    When non-zero, reserve this much address space so resize() grows and shrinks in place and
+    //!                   pins / unpins only the changed range. Zero keeps the mremap + full re-registration path.
+    explicit HostMem(size_t size, size_t alignHint = kAlignment, size_t maxSize = 0);
     ~HostMem();
 
     HostMem(HostMem const&) = delete;
     HostMem& operator=(HostMem const&) = delete;
 
-    // Resize in-place (mremap, preserves data). Unregisters and re-registers with CUDA.
+    // Resize, preserving data. In place (fixed address, delta registration) when address space was reserved;
+    // otherwise mremap with full unregistration and re-registration.
     void resize(size_t newSize);
 
     // Unregister from CUDA and unmap. Safe to call multiple times.
@@ -70,15 +78,39 @@ public:
     }
 
 private:
+    static constexpr size_t kMaxExtentSize = 1ULL << 30; // 1 GB, below the 2 GB kernel-bug limit
+
     void registerToCuda();
     void unregisterFromCuda();
     void madvisePageMode();
     void parallelPrefault(int numThreads);
+    void parallelPrefaultRange(size_t begin, size_t end, int numThreads);
+
+    // Reserved-address-space (delta registration) mode.
+    [[nodiscard]] bool reserved() const noexcept
+    {
+        return mReserved != 0;
+    }
+
+    void initReserved(size_t size, size_t maxSize);
+    void resizeReserved(size_t newSize);
+    void commitRange(size_t begin, size_t end);
+    void releaseRange(size_t begin, size_t end) noexcept;
+    void registerRange(size_t begin, size_t end);
+    void unregisterAfter(size_t offset);
+    void unregisterAllExtents() noexcept;
 
     MemAddress mAddr = 0;
     size_t mSize = 0;
     int mNumRegisteredChunks = 0;
     bool mUseThp = true;
+
+    size_t mReserved = 0;             // reserved address space in bytes; 0 = mremap mode
+    size_t mRegAlign = kAlignment;    // lcm(kAlignment, alignHint): legal extent boundary
+    size_t mMaxExtent = kMaxExtentSize;
+    // Registered extents [begin, end) as offsets, ascending and contiguous from 0 to mSize. Every boundary except
+    // mSize is a multiple of mRegAlign; a final extent shorter than mRegAlign is the unaligned tail.
+    std::vector<std::pair<size_t, size_t>> mExtents;
 };
 
 // ---------------------------------------------------------------------------
