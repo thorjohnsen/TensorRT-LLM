@@ -583,8 +583,7 @@ GpuPoolGroup::GpuPoolGroup(
 // HostPoolGroup
 // ---------------------------------------------------------------------------
 
-HostPoolGroup::HostPoolGroup(
-    SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, SlotCount maxNumSlots)
+HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, SlotCount maxNumSlots)
     : PoolGroupBase(numSlots)
 {
     for (size_t sz : slotSizeList)

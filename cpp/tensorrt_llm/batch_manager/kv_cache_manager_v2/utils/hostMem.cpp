@@ -20,6 +20,7 @@
 #include "kv_cache_manager_v2/utils/math.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -30,8 +31,8 @@
 #include <exception>
 #include <fcntl.h>
 #include <mutex>
-#include <optional>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -203,8 +204,12 @@ HostMem::HostMem(size_t size, size_t alignHint, size_t maxSize)
     {
         mRegAlign = regAlign;
         mMaxExtent = kMaxExtentSize / regAlign * regAlign;
-        initReserved(size, std::max(maxSize, size));
-        return;
+        if (initReserved(size, std::max(maxSize, size)))
+        {
+            return;
+        }
+        mRegAlign = kAlignment;
+        mMaxExtent = kMaxExtentSize;
     }
     if (size == 0)
     {
@@ -385,13 +390,18 @@ void HostMem::unregisterFromCuda()
 // region; extents are cut only at multiples of mRegAlign (a multiple of the slot size), so no slot straddles two.
 // ---------------------------------------------------------------------------
 
-void HostMem::initReserved(size_t size, size_t maxSize)
+bool HostMem::initReserved(size_t size, size_t maxSize)
 {
     size_t const reserve = roundUp(std::max(maxSize, kAlignment), kAlignment);
     void* ptr = ::mmap(nullptr, reserve, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (ptr == MAP_FAILED || ptr == nullptr)
     {
-        throw HostOOMError(std::string("mmap reserve failed: ") + std::strerror(errno));
+        // Address space can be limited (RLIMIT_AS); the mremap mode needs only the committed size.
+        TLLM_LOG_WARNING(
+            "HostMem: cannot reserve %zu bytes of address space (%s); resizing will re-register the "
+            "whole buffer",
+            reserve, std::strerror(errno));
+        return false;
     }
     mAddr = reinterpret_cast<MemAddress>(ptr);
     mReserved = reserve;
@@ -409,6 +419,7 @@ void HostMem::initReserved(size_t size, size_t maxSize)
         mReserved = 0;
         throw;
     }
+    return true;
 }
 
 void HostMem::commitRange(size_t begin, size_t end)
@@ -422,8 +433,16 @@ void HostMem::commitRange(size_t begin, size_t end)
     {
         throw HostOOMError(std::string("mprotect failed: ") + std::strerror(errno));
     }
-    hostMadvisePageMode(mAddr + begin, end - begin, mUseThp);
-    parallelPrefaultRange(begin, end, hostPrefaultThreads());
+    try
+    {
+        hostMadvisePageMode(mAddr + begin, end - begin, mUseThp);
+        parallelPrefaultRange(begin, end, hostPrefaultThreads());
+    }
+    catch (...)
+    {
+        releaseRange(begin, end);
+        throw;
+    }
 }
 
 void HostMem::releaseRange(size_t begin, size_t end) noexcept
@@ -512,8 +531,8 @@ void HostMem::resizeReserved(size_t newSize)
         unregisterAllExtents();
         if (oldSize > 0)
         {
-            void* moved = ::mremap(
-                reinterpret_cast<void*>(mAddr), oldSize, oldSize, MREMAP_MAYMOVE | MREMAP_FIXED, fresh);
+            void* moved
+                = ::mremap(reinterpret_cast<void*>(mAddr), oldSize, oldSize, MREMAP_MAYMOVE | MREMAP_FIXED, fresh);
             if (moved == MAP_FAILED)
             {
                 int const err = errno;
@@ -528,8 +547,19 @@ void HostMem::resizeReserved(size_t newSize)
         }
         mAddr = reinterpret_cast<MemAddress>(fresh);
         mReserved = reserve;
-        commitRange(oldSize, newSize);
-        registerRange(0, newSize);
+        try
+        {
+            commitRange(oldSize, newSize);
+            registerRange(0, newSize);
+        }
+        catch (...)
+        {
+            // The data now lives at the new address; restore the old size there.
+            unregisterAllExtents();
+            releaseRange(oldSize, newSize);
+            registerRange(0, oldSize);
+            throw;
+        }
         mSize = newSize;
         return;
     }

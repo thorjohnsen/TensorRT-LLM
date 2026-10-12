@@ -27,8 +27,14 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
 // ---------------------------------------------------------------------------
-// HostMem — mmap-backed pinned host memory, resizable via mremap.
-// Mirrors _utils.py::HostMem.
+// HostMem — mmap-backed pinned host memory, resizable.
+//
+// Given a maximum size, HostMem reserves that much address space up front and resizes in place: the buffer never
+// moves, CUDA registrations stay valid, and a resize pins or unpins only the changed range. Registrations are kept
+// in extents of at most 1 GB whose boundaries are multiples of lcm(4 KB, alignHint), so with alignHint = slot size no
+// slot straddles two registrations and per-slot copy-engine descriptors stay inside one registered region.
+// TLLM_KV_CACHE_MANAGER_V2_HOST_DELTA_PIN=0 disables this. Without a maximum size (or if the reservation fails),
+// resize() mremaps the buffer and re-registers all of it.
 //
 // Memory is:
 //   - Anonymous private mmap
@@ -92,7 +98,8 @@ private:
         return mReserved != 0;
     }
 
-    void initReserved(size_t size, size_t maxSize);
+    //! Returns false, leaving the object empty, when the address space cannot be reserved.
+    bool initReserved(size_t size, size_t maxSize);
     void resizeReserved(size_t newSize);
     void commitRange(size_t begin, size_t end);
     void releaseRange(size_t begin, size_t end) noexcept;
@@ -105,8 +112,8 @@ private:
     int mNumRegisteredChunks = 0;
     bool mUseThp = true;
 
-    size_t mReserved = 0;             // reserved address space in bytes; 0 = mremap mode
-    size_t mRegAlign = kAlignment;    // lcm(kAlignment, alignHint): legal extent boundary
+    size_t mReserved = 0;          // reserved address space in bytes; 0 = mremap mode
+    size_t mRegAlign = kAlignment; // lcm(kAlignment, alignHint): legal extent boundary
     size_t mMaxExtent = kMaxExtentSize;
     // Registered extents [begin, end) as offsets, ascending and contiguous from 0 to mSize. Every boundary except
     // mSize is a multiple of mRegAlign; a final extent shorter than mRegAlign is the unaligned tail.

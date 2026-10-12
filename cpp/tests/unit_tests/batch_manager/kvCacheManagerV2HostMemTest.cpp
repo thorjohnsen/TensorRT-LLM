@@ -276,7 +276,8 @@ TEST(KvCacheManagerV2HostMemTest, ReservedExtentsNeverSplitASlot)
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
 
     constexpr size_t kSlot = 3 * HostMem::kAlignment + 2048; // 14336, lcm with 4 KiB is 28672
-    auto const bytesFor = [](size_t slots) { return (slots * kSlot + HostMem::kAlignment - 1) / HostMem::kAlignment * HostMem::kAlignment; };
+    auto const bytesFor = [](size_t slots)
+    { return (slots * kSlot + HostMem::kAlignment - 1) / HostMem::kAlignment * HostMem::kAlignment; };
     HostMem memory(bytesFor(100), kSlot, bytesFor(4000));
     for (size_t slots : {size_t{1003}, size_t{517}, size_t{2999}, size_t{9}, size_t{4000}})
     {
@@ -290,6 +291,24 @@ TEST(KvCacheManagerV2HostMemTest, ReservedExtentsNeverSplitASlot)
             EXPECT_TRUE(isRegistered(slotAddr + kSlot - 1)) << "slots=" << slots << " slot=" << slot;
         }
     }
+}
+
+TEST(KvCacheManagerV2HostMemTest, OversizedAlignmentFallsBackToFullRegistration)
+{
+    ScopedEnv prefault("TLLM_KV_CACHE_MANAGER_V2_PREFAULT_THREADS", "0");
+    ScopedEnv delta("TLLM_KV_CACHE_MANAGER_V2_HOST_DELTA_PIN", std::nullopt);
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    // lcm(4 KiB, 1 MiB + 1) is ~4 GiB, beyond the 1 GiB extent limit, so this pool cannot use slot-aligned extents.
+    constexpr size_t kMiB = 1 << 20;
+    HostMem memory(4 * kMiB, kMiB + 1, 64 * kMiB);
+    fillPattern(memory.address(), 0, 4 * kMiB);
+    memory.resize(32 * kMiB);
+    EXPECT_TRUE(checkPattern(memory.address(), 0, 4 * kMiB));
+    EXPECT_TRUE(isRegistered(memory.address() + 32 * kMiB - HostMem::kAlignment));
+    memory.resize(8 * kMiB);
+    EXPECT_TRUE(checkPattern(memory.address(), 0, 4 * kMiB));
+    EXPECT_FALSE(isRegistered(memory.address() + 8 * kMiB));
 }
 
 TEST(KvCacheManagerV2HostMemTest, DeltaPinCanBeDisabled)
