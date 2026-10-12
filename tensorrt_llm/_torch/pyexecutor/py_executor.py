@@ -5362,7 +5362,14 @@ class PyExecutor:
             f"before={_stats_before} "
             f"after={self._nvbug6900756_pool_stats(mgr)} "
             f"levels_before={_levels_before} "
-            f"levels_after={self._nvbug6900756_levels(mgr)}")
+            f"levels_after={self._nvbug6900756_levels(mgr)} "
+            f"level_secs={self._nvbug6900756_level_secs()}")
+
+    @staticmethod
+    def _nvbug6900756_level_secs() -> str:
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import _cpp_introspection
+        return "[" + ",".join(
+            f"{x:.4f}" for x in _cpp_introspection.last_adjust_level_seconds()) + "]"
 
     @staticmethod
     def _nvbug6900756_levels(mgr) -> str:
