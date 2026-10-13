@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "kv_cache_manager_v2/nvbug6900756Timer.h"
 #include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/batchedPageCopy.h"
 #include "kv_cache_manager_v2/blockRadixTree.h"
@@ -1702,7 +1703,11 @@ void StorageManager::expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, Slo
 {
     auto& pg = poolGroup(level, pgIdx);
     TLLM_CHECK_DEBUG(newNumSlots > pg.numSlots());
-    pg.resizePools(newNumSlots);
+    {
+        Nvbug6900756Timer const timer("expand.resizePools");
+        pg.resizePools(newNumSlots);
+    }
+    Nvbug6900756Timer const timer("expand.slotAllocator");
     pg.slotAllocator().expand(newNumSlots);
 }
 
@@ -1733,6 +1738,7 @@ void StorageManager::shrinkPoolGroup(
     {
         allocator.prepareForShrink(newNumSlots);
         allocator.finishShrink();
+        Nvbug6900756Timer const timer("shrink.resizePools");
         pg.resizePools(newNumSlots);
         return;
     }
@@ -1741,6 +1747,7 @@ void StorageManager::shrinkPoolGroup(
     auto gen = ctrl.pageGenerator(pgIdx);
     std::deque<std::pair<SlotCount, SharedPtr<Page>>> overflowSlots;
     {
+        Nvbug6900756Timer const timer("shrink.scan");
         SlotCount idx = 0;
         while (auto const* page = gen())
         {
@@ -1785,7 +1792,11 @@ void StorageManager::shrinkPoolGroup(
     // Force-evict the required pages.
     TypedVec<PoolGroupIndex, SlotCount> evictReqs(numPoolGroups(level), 0);
     evictReqs[pgIdx] = minNumEvicted;
-    forceEvict(level, evictReqs);
+    nvbug6900756AddPhase("n.evicted", static_cast<double>(minNumEvicted));
+    {
+        Nvbug6900756Timer const timer("shrink.forceEvict");
+        forceEvict(level, evictReqs);
+    }
 
     // Remaining overflow pages to defragment.
     std::vector<SharedPtr<Page>> overflowPages;
@@ -1798,7 +1809,11 @@ void StorageManager::shrinkPoolGroup(
     // Ensure free slots for the overflow pages.
     TypedVec<PoolGroupIndex, SlotCount> reqs(numPoolGroups(level), 0);
     reqs[pgIdx] = slotCountValueFromSize(overflowPages.size());
-    prepareFreeSlots(level, reqs);
+    nvbug6900756AddPhase("n.defragPages", static_cast<double>(overflowPages.size()));
+    {
+        Nvbug6900756Timer const timer("shrink.prepareFreeSlots");
+        prepareFreeSlots(level, reqs);
+    }
 
     // A17: all overflow pages must be at the expected cache level.
     TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(overflowPages.begin(), overflowPages.end(),
@@ -1806,7 +1821,10 @@ void StorageManager::shrinkPoolGroup(
         "Overflow page cache level mismatch");
 
     // Defragment: migrate overflow pages to free slots within the same level.
-    _batchedMigrate(level, level, overflowPages, /*updateSrc=*/true, MigrationRecorder{}, /*defrag=*/true);
+    {
+        Nvbug6900756Timer const timer("shrink.migrate");
+        _batchedMigrate(level, level, overflowPages, /*updateSrc=*/true, MigrationRecorder{}, /*defrag=*/true);
+    }
 
     // A18: post-defrag overflow assertion — overflow slot count matches expectations.
     TLLM_CHECK_DEBUG_WITH_INFO(allocator.numOverflowSlots() == allocator.numActiveSlots() - allocator.targetCapacity(),
@@ -1814,6 +1832,7 @@ void StorageManager::shrinkPoolGroup(
 
     // Finalize shrink and resize pools.
     allocator.finishShrink();
+    Nvbug6900756Timer const timer("shrink.resizePools");
     pg.resizePools(newNumSlots);
 }
 
@@ -1862,6 +1881,7 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     if (lvlStorage.cacheTier() == CacheTier::GPU_MEM)
     {
         TLLM_CHECK_DEBUG(mGpuPhysMemAllocator);
+        Nvbug6900756Timer const timer("gpu.clearPool");
         mGpuPhysMemAllocator->clear();
     }
 }

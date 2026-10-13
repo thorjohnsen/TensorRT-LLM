@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "kv_cache_manager_v2/nvbug6900756Timer.h"
 #include "kv_cache_manager_v2/cudaVirtMem.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/utils/math.h"
@@ -50,11 +51,14 @@ static bool isPropSupported(CUmemAllocationProp const& prop)
 
 PhysMemWrapper::PhysMemWrapper(size_t size, CUmemAllocationProp const& prop)
 {
+    Nvbug6900756Timer const timer("gpu.memCreate");
+    nvbug6900756AddPhase("n.memCreate", 1);
     cuCheck(cuMemCreate(&mHandle, size, &prop, 0));
 }
 
 PhysMemWrapper::~PhysMemWrapper()
 {
+    Nvbug6900756Timer const timer("gpu.memRelease");
     cuMemRelease(mHandle);
 }
 
@@ -155,8 +159,15 @@ void VirtMem::push(PooledPhysMemAllocator::PooledPhysMem handle)
     CUdeviceptr offset = mAddr + physSize * static_cast<size_t>(mPhysHandles.size());
     TLLM_CHECK_DEBUG(physSize * (mPhysHandles.size() + 1) <= mVmSize);
 
-    cuCheck(cuMemMap(offset, physSize, 0, handle->handle(), 0));
-    cuCheck(cuMemSetAccess(offset, physSize, &mAccessDesc, 1));
+    nvbug6900756AddPhase("n.map", 1);
+    {
+        Nvbug6900756Timer const timer("gpu.memMap");
+        cuCheck(cuMemMap(offset, physSize, 0, handle->handle(), 0));
+    }
+    {
+        Nvbug6900756Timer const timer("gpu.setAccess");
+        cuCheck(cuMemSetAccess(offset, physSize, &mAccessDesc, 1));
+    }
     mPhysHandles.push_back(std::move(handle));
 }
 
@@ -165,7 +176,11 @@ void VirtMem::pop()
     TLLM_CHECK_DEBUG(!mPhysHandles.empty());
     size_t physSize = mPhysMemAllocator.physMemSize();
     CUdeviceptr offset = mAddr + physSize * (mPhysHandles.size() - 1);
-    cuCheck(cuMemUnmap(offset, physSize));
+    nvbug6900756AddPhase("n.unmap", 1);
+    {
+        Nvbug6900756Timer const timer("gpu.memUnmap");
+        cuCheck(cuMemUnmap(offset, physSize));
+    }
     mPhysHandles.pop_back(); // PhysMemHandle destructor returns to pool
 }
 
@@ -192,7 +207,10 @@ void VirtMem::extend(size_t numToAdd)
 
 void VirtMem::shrink(size_t numToRemove)
 {
-    cuCheck(cuCtxSynchronize());
+    {
+        Nvbug6900756Timer const timer("gpu.ctxSync");
+        cuCheck(cuCtxSynchronize());
+    }
     for (size_t i = 0; i < numToRemove; ++i)
     {
         pop();

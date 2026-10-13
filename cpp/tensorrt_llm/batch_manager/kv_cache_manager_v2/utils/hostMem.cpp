@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "kv_cache_manager_v2/nvbug6900756Timer.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/exceptions.h"
 
@@ -223,6 +224,7 @@ void HostMem::resize(size_t newSize)
     unregisterFromCuda();
     try
     {
+        Nvbug6900756Timer const timer("host.remap");
         mAddr = hostMremap(mAddr, mSize, newSize);
         TLLM_CHECK_DEBUG(mAddr % kAlignment == 0);
         mSize = newSize;
@@ -310,6 +312,7 @@ void HostMem::parallelPrefault(int numThreads)
 void HostMem::registerToCuda()
 {
     TLLM_CHECK_DEBUG(mNumRegisteredChunks == 0);
+    Nvbug6900756Timer const timer("host.register");
     static bool chunked = shouldUseChunkedRegistration();
 
     size_t chunkSize = (chunked && mSize > kChunkSize) ? kChunkSize : mSize;
@@ -325,6 +328,7 @@ void HostMem::registerToCuda()
 
 void HostMem::unregisterFromCuda()
 {
+    Nvbug6900756Timer const timer("host.unregister");
     static bool chunked = shouldUseChunkedRegistration();
     size_t chunkSize = (chunked && mSize > kChunkSize) ? kChunkSize : mSize;
     for (size_t offset = 0; offset < mSize && mNumRegisteredChunks > 0; offset += chunkSize)

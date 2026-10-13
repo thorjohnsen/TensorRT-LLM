@@ -5570,7 +5570,18 @@ class PyExecutor:
             f"levels_after={self._nvbug6900756_levels(mgr)} "
             f"bytes_before={_bytes_before} "
             f"bytes_after={self._nvbug6900756_level_bytes(mgr)} "
-            f"level_secs={self._nvbug6900756_level_secs()}")
+            f"level_secs={self._nvbug6900756_level_secs()} "
+            f"level_phases={self._nvbug6900756_level_phases()}")
+
+    @staticmethod
+    def _nvbug6900756_level_phases() -> str:
+        """Per cache level: instrumented adjust() phase seconds and n.* counts."""
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import _cpp_introspection
+        parts = []
+        for lvl, phases in enumerate(_cpp_introspection.last_adjust_phases()):
+            body = ",".join(f"{k}={v:.4f}" for k, v in sorted(phases.items()))
+            parts.append(f"L{lvl}:<{body}>")
+        return "{" + " ".join(parts) + "}"
 
     @staticmethod
     def _nvbug6900756_level_secs() -> str:
