@@ -2368,6 +2368,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     // White-box test hooks: mutate auto-tuner state so accuracy tests can force
     // a pool rebalance. Mirror the Python manager's internal attributes.
     mIntrospection.def("last_adjust_level_seconds", []() { return kv::KvCacheIntrospection::lastAdjustLevelSeconds(); });
+    mIntrospection.def("last_adjust_phases", []() { return kv::KvCacheIntrospection::lastAdjustPhases(); });
     mIntrospection.def(
         "level_pool_group_bytes",
         [](kv::KvCacheManager const& manager) { return kv::KvCacheIntrospection::levelPoolGroupBytes(manager); },

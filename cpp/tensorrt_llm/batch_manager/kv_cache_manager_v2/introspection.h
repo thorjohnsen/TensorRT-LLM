@@ -23,6 +23,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <string>
 #include <optional>
 #include <tuple>
 #include <vector>
@@ -58,6 +60,8 @@ public:
         KvCacheManager const& manager);
     // Seconds spent per level by the last adjust() (0 for levels it skipped).
     static std::vector<double> lastAdjustLevelSeconds();
+    // Per level: wall seconds (and n.* counts) per instrumented phase in the last adjust().
+    static std::vector<std::map<std::string, double>> lastAdjustPhases();
     // Per cache level: (allocated bytes per pool group, level quota in bytes).
     static std::vector<std::tuple<std::vector<size_t>, size_t>> levelPoolGroupBytes(KvCacheManager const& manager);
 };

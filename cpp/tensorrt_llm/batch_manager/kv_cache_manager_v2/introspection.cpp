@@ -140,6 +140,13 @@ std::vector<double> KvCacheIntrospection::lastAdjustLevelSeconds()
     return gNvbug6900756AdjustLevelSeconds;
 }
 
+extern std::vector<std::map<std::string, double>> gNvbug6900756AdjustPhases;
+
+std::vector<std::map<std::string, double>> KvCacheIntrospection::lastAdjustPhases()
+{
+    return gNvbug6900756AdjustPhases;
+}
+
 std::vector<std::tuple<std::vector<float>, std::vector<float>, bool>> KvCacheIntrospection::levelRebalanceState(
     KvCacheManager const& manager)
 {

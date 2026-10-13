@@ -1059,6 +1059,13 @@ bool KvCacheManager::needAdjustment() const
 
 // Experiment-only (nvbug 6900756): wall seconds spent in _adjustLevel per level by the last adjust().
 std::vector<double> gNvbug6900756AdjustLevelSeconds;
+std::vector<std::map<std::string, double>> gNvbug6900756AdjustPhases;
+static std::map<std::string, double> gNvbug6900756PhaseAccum;
+
+void nvbug6900756AddPhase(char const* name, double value)
+{
+    gNvbug6900756PhaseAccum[name] += value;
+}
 
 void KvCacheManager::adjust()
 {
@@ -1071,13 +1078,16 @@ void KvCacheManager::adjust()
 
     CacheLevel numLevels = mStorage->numCacheLevels();
     gNvbug6900756AdjustLevelSeconds.assign(numLevels.value(), 0.0);
+    gNvbug6900756AdjustPhases.assign(numLevels.value(), {});
     for (CacheLevel level{0}; level < numLevels; ++level)
     {
         if (_needAdjustment(level))
         {
+            gNvbug6900756PhaseAccum.clear();
             double const start = nowSeconds();
             _adjustLevel(level, getQuota(level));
             gNvbug6900756AdjustLevelSeconds[level.value()] = nowSeconds() - start;
+            gNvbug6900756AdjustPhases[level.value()] = gNvbug6900756PhaseAccum;
         }
     }
     mLastAdjustmentTime = nowSeconds();
