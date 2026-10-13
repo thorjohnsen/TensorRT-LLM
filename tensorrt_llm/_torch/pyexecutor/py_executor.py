@@ -5318,6 +5318,7 @@ class PyExecutor:
         paused_dummies = self._suspend_padding_dummies_for_rebalance(mgr)
         _t1 = time.perf_counter()
         _levels_before = self._nvbug6900756_levels(mgr)
+        _bytes_before = self._nvbug6900756_level_bytes(mgr)
 
         try:
             mgr.impl.adjust()
@@ -5363,6 +5364,8 @@ class PyExecutor:
             f"after={self._nvbug6900756_pool_stats(mgr)} "
             f"levels_before={_levels_before} "
             f"levels_after={self._nvbug6900756_levels(mgr)} "
+            f"bytes_before={_bytes_before} "
+            f"bytes_after={self._nvbug6900756_level_bytes(mgr)} "
             f"level_secs={self._nvbug6900756_level_secs()}")
 
     @staticmethod
@@ -5370,6 +5373,17 @@ class PyExecutor:
         from tensorrt_llm.runtime.kv_cache_manager_v2 import _cpp_introspection
         return "[" + ",".join(
             f"{x:.4f}" for x in _cpp_introspection.last_adjust_level_seconds()) + "]"
+
+    @staticmethod
+    def _nvbug6900756_level_bytes(mgr) -> str:
+        """Per cache level: allocated bytes per pool group, their sum, and the level quota."""
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import _cpp_introspection
+        parts = []
+        for lvl, (pg_bytes, quota) in enumerate(
+                _cpp_introspection.level_pool_group_bytes(mgr.impl)):
+            pgs = ",".join(str(b) for b in pg_bytes)
+            parts.append(f"L{lvl}:pg=[{pgs}]:total={sum(pg_bytes)}:quota={quota}")
+        return "{" + " ".join(parts) + "}"
 
     @staticmethod
     def _nvbug6900756_levels(mgr) -> str:

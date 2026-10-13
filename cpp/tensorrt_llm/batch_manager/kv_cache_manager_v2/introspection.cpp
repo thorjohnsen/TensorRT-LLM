@@ -17,6 +17,8 @@
 
 #include "kv_cache_manager_v2/introspection.h"
 
+#include <numeric>
+
 #include "kv_cache_manager_v2/blockRadixTree.h"
 
 #include "kv_cache_manager_v2/kvCache.h"
@@ -150,6 +152,29 @@ std::vector<std::tuple<std::vector<float>, std::vector<float>, bool>> KvCacheInt
         auto const& target = manager._getTargetRatioList(level);
         out.emplace_back(std::vector<float>(current.raw().begin(), current.raw().end()),
             std::vector<float>(target.raw().begin(), target.raw().end()), manager._needAdjustment(level));
+    }
+    return out;
+}
+
+std::vector<std::tuple<std::vector<size_t>, size_t>> KvCacheIntrospection::levelPoolGroupBytes(
+    KvCacheManager const& manager)
+{
+    auto const apiLock = manager.lockShared();
+    std::vector<std::tuple<std::vector<size_t>, size_t>> out;
+    auto const& levels = manager.mStorage->mLevels;
+    CacheLevel const numLevels = manager.mStorage->numCacheLevels();
+    for (CacheLevel level{0}; level < numLevels; ++level)
+    {
+        auto const& storage = *levels.at(level).storage;
+        auto const counts = storage.slotCountList();
+        auto const sizes = storage.slotSizeLists();
+        std::vector<size_t> bytes;
+        for (PoolGroupIndex pg{0}; pg < counts.size(); ++pg)
+        {
+            size_t const slotBytes = std::accumulate(sizes[pg].begin(), sizes[pg].end(), size_t{0});
+            bytes.push_back(slotBytes * slotCountToSizeT(counts[pg]));
+        }
+        out.emplace_back(std::move(bytes), storage.totalQuota());
     }
     return out;
 }

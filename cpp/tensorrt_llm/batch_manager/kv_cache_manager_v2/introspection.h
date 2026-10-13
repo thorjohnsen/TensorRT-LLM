@@ -58,6 +58,8 @@ public:
         KvCacheManager const& manager);
     // Seconds spent per level by the last adjust() (0 for levels it skipped).
     static std::vector<double> lastAdjustLevelSeconds();
+    // Per cache level: (allocated bytes per pool group, level quota in bytes).
+    static std::vector<std::tuple<std::vector<size_t>, size_t>> levelPoolGroupBytes(KvCacheManager const& manager);
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
