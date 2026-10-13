@@ -2368,6 +2368,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     // a pool rebalance. Mirror the Python manager's internal attributes.
     mIntrospection.def("last_adjust_level_seconds", []() { return kv::KvCacheIntrospection::lastAdjustLevelSeconds(); });
     mIntrospection.def(
+        "level_pool_group_bytes",
+        [](kv::KvCacheManager const& manager) { return kv::KvCacheIntrospection::levelPoolGroupBytes(manager); },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
         "level_rebalance_state",
         [](kv::KvCacheManager const& manager) { return kv::KvCacheIntrospection::levelRebalanceState(manager); },
         nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
