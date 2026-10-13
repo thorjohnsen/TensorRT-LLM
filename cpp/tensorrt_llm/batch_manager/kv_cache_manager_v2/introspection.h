@@ -55,6 +55,7 @@ public:
     static void setNumSampledKvCaches(KvCacheManager& manager, int value);
     static void setLastAdjustmentTime(KvCacheManager& manager, double value);
     static void setTargetRatioListGpu(KvCacheManager& manager, TypedVec<PoolGroupIndex, float> value);
+    static void setTargetRatioListCold(KvCacheManager& manager, TypedVec<PoolGroupIndex, float> value);
     // Per cache level: (current ratio, target ratio, needs adjustment), as adjust() computes them.
     static std::vector<std::tuple<std::vector<float>, std::vector<float>, bool>> levelRebalanceState(
         KvCacheManager const& manager);

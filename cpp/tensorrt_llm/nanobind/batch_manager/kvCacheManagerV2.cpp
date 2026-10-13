@@ -2394,6 +2394,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 manager, kv::TypedVec<kv::PoolGroupIndex, float>{std::move(ratios)});
         },
         nb::arg("manager"), nb::arg("ratios"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "set_target_ratio_list_cold",
+        [](kv::KvCacheManager& manager, std::vector<float> ratios)
+        {
+            kv::KvCacheIntrospection::setTargetRatioListCold(
+                manager, kv::TypedVec<kv::PoolGroupIndex, float>{std::move(ratios)});
+        },
+        nb::arg("manager"), nb::arg("ratios"), nb::call_guard<nb::gil_scoped_release>());
     // White-box reuse-tree introspection: mirror the Python manager's _life_cycles
     // and _radix_tree attributes so shared tests can inspect reuse state.
     mIntrospection.def(

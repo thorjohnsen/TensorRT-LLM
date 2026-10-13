@@ -16,18 +16,25 @@
  */
 
 #include "kv_cache_manager_v2/storage/core.h"
+#include "kv_cache_manager_v2/nvbug6900756Timer.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include <algorithm>
+#include <atomic>
+#include <cuda.h>
+#include <thread>
 #include <cerrno>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
 #include <numeric>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 #include <unistd.h>
 #include <unordered_map>
 
@@ -365,25 +372,61 @@ size_t HostSlotPool::alignedSize(SlotCount numSlots) const noexcept
     return roundUp(slotCountToSizeT(numSlots) * mSlotSize, HostMem::kAlignment);
 }
 
+HostSlotPool::HostSlotPool(
+    size_t slotSize, HostMem const& arena, size_t offset, size_t capacityBytes, SlotCount numSlots)
+    : SlotPoolBase(slotSize)
+    , mHostMem(0)
+    , mArena(&arena)
+{
+    setArenaRegion(offset, capacityBytes);
+    resize(numSlots);
+}
+
+void HostSlotPool::setArenaRegion(size_t offset, size_t capacityBytes)
+{
+    TLLM_CHECK_WITH_INFO(mArena != nullptr, "HostSlotPool::setArenaRegion: not an arena pool");
+    TLLM_CHECK_WITH_INFO(offset + capacityBytes <= mArena->size(), "HostSlotPool: region exceeds the arena");
+    mArenaOffset = offset;
+    mArenaCapacity = capacityBytes;
+}
+
 SlotCount HostSlotPool::numSlots() const noexcept
 {
+    if (mArena != nullptr)
+    {
+        return mArenaNumSlots;
+    }
     return slotCountValueFromSize(mHostMem.size() / mSlotSize);
 }
 
 void HostSlotPool::destroy()
 {
+    if (mArena != nullptr)
+    {
+        mArenaNumSlots = 0;
+        return;
+    }
     mHostMem.destroy();
 }
 
 void HostSlotPool::resize(SlotCount newNumSlots)
 {
+    if (mArena != nullptr)
+    {
+        TLLM_CHECK_WITH_INFO(slotCountToSizeT(newNumSlots) * mSlotSize <= mArenaCapacity,
+            "HostSlotPool::resize: %zu slots exceed the pool's arena region of %zu bytes",
+            slotCountToSizeT(newNumSlots), mArenaCapacity);
+        mArenaNumSlots = newNumSlots;
+        return;
+    }
     mHostMem.resize(alignedSize(newNumSlots));
 }
 
 Address HostSlotPool::slotAddress(SlotId slot) const
 {
     TLLM_CHECK_DEBUG_WITH_INFO(isValidSlotId(slot), "HostSlotPool::slotAddress: slot index out of bounds");
-    return MemAddress(mHostMem.address() + mSlotSize * toSizeT(slot));
+    MemAddress const base = mArena != nullptr ? mArena->address() + mArenaOffset : mHostMem.address();
+    return MemAddress(base + mSlotSize * toSizeT(slot));
 }
 
 // ---------------------------------------------------------------------------
@@ -592,6 +635,19 @@ HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> con
     }
 }
 
+HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, HostMem const& arena,
+    std::vector<size_t> const& offsets, std::vector<size_t> const& capacities)
+    : PoolGroupBase(numSlots)
+{
+    size_t i = 0;
+    for (size_t sz : slotSizeList)
+    {
+        TLLM_CHECK_DEBUG(i < offsets.size() && i < capacities.size());
+        mPools.push_back(std::make_unique<HostSlotPool>(sz, arena, offsets[i], capacities[i], numSlots));
+        ++i;
+    }
+}
+
 HostMem const* HostPoolGroup::hostMem(PoolIndex poolIndex) const
 {
     return static_cast<HostSlotPool const&>(*mPools.at(poolIndex)).hostMem();
@@ -656,11 +712,158 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> co
 // HostCacheLevelStorage
 // ---------------------------------------------------------------------------
 
+namespace
+{
+
+bool hostArenaEnabled()
+{
+    char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_HOST_ARENA");
+    // One registration over the whole tier is unsafe on kernels that need chunked registration.
+    return value != nullptr && std::string_view(value) == "1" && !HostMem::shouldUseChunkedRegistration();
+}
+
+bool hostArenaVerify()
+{
+    char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_HOST_ARENA_VERIFY");
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+int hostMoveThreads()
+{
+    if (char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_HOST_MOVE_THREADS"))
+    {
+        return std::max(1, std::atoi(value));
+    }
+    unsigned int const cpus = std::max(1U, std::thread::hardware_concurrency());
+    return static_cast<int>(std::clamp(cpus / 8U, 1U, 32U));
+}
+
+// Copies [src, src + len) to dst (non-overlapping) with up to numThreads threads.
+void parallelCopy(char* dst, char const* src, size_t len, int numThreads)
+{
+    constexpr size_t kMinPiece = size_t{16} << 20;
+    size_t const pieces = std::min<size_t>(static_cast<size_t>(numThreads), std::max<size_t>(1, len / kMinPiece));
+    if (pieces <= 1)
+    {
+        std::memcpy(dst, src, len);
+        return;
+    }
+    size_t const piece = divUp(len, pieces);
+    std::vector<std::thread> workers;
+    workers.reserve(pieces);
+    for (size_t i = 0; i < pieces; ++i)
+    {
+        size_t const begin = i * piece;
+        if (begin >= len)
+        {
+            break;
+        }
+        size_t const n = std::min(piece, len - begin);
+        workers.emplace_back([=]() { std::memcpy(dst + begin, src + begin, n); });
+    }
+    for (auto& w : workers)
+    {
+        w.join();
+    }
+}
+
+// memmove with threads: when the ranges overlap, copy in segments no longer than the shift, ordered so that a
+// segment's source is never overwritten before it is read.
+void parallelMove(char* dst, char const* src, size_t len, int numThreads)
+{
+    if (dst == src || len == 0)
+    {
+        return;
+    }
+    size_t const shift = dst > src ? static_cast<size_t>(dst - src) : static_cast<size_t>(src - dst);
+    if (shift >= len)
+    {
+        parallelCopy(dst, src, len, numThreads);
+        return;
+    }
+    if (dst < src)
+    {
+        for (size_t begin = 0; begin < len; begin += shift)
+        {
+            parallelCopy(dst + begin, src + begin, std::min(shift, len - begin), numThreads);
+        }
+        return;
+    }
+    for (size_t end = len; end > 0;)
+    {
+        size_t const n = std::min(shift, end);
+        end -= n;
+        parallelCopy(dst + end, src + end, n, numThreads);
+    }
+}
+
+uint64_t checksum(char const* ptr, size_t len, int numThreads)
+{
+    size_t const words = len / sizeof(uint64_t);
+    std::atomic<uint64_t> total{0};
+    size_t const pieces = std::max<size_t>(1, std::min<size_t>(static_cast<size_t>(numThreads), words / 4096));
+    size_t const piece = divUp(std::max<size_t>(words, 1), pieces);
+    std::vector<std::thread> workers;
+    for (size_t i = 0; i < pieces; ++i)
+    {
+        workers.emplace_back(
+            [&, i]()
+            {
+                uint64_t sum = 0;
+                auto const* w = reinterpret_cast<uint64_t const*>(ptr);
+                for (size_t j = i * piece; j < std::min(words, (i + 1) * piece); ++j)
+                {
+                    sum += w[j] * (2 * j + 1);
+                }
+                total.fetch_add(sum);
+            });
+    }
+    for (auto& w : workers)
+    {
+        w.join();
+    }
+    uint64_t tail = 0;
+    for (size_t j = words * sizeof(uint64_t); j < len; ++j)
+    {
+        tail = tail * 131 + static_cast<unsigned char>(ptr[j]);
+    }
+    return total.load() ^ tail;
+}
+
+} // namespace
+
 HostCacheLevelStorage::HostCacheLevelStorage(
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList)
 {
     TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
         "HostCacheLevelStorage: slotCountList and slotDescList must have the same length");
+    if (hostArenaEnabled())
+    {
+        // One pinned buffer for the whole tier; each pool is a kAlignment-aligned region of it. adjust() keeps the
+        // tier total fixed, so the buffer never grows and is registered exactly once.
+        size_t total = 0;
+        TypedVec<PoolGroupIndex, std::vector<size_t>> offsets(slotDescList.size());
+        TypedVec<PoolGroupIndex, std::vector<size_t>> capacities(slotDescList.size());
+        for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
+        {
+            for (size_t sz : slotDescList[pgIdx].slotSizeList())
+            {
+                size_t const bytes = roundUp(slotCountToSizeT(slotCountList[pgIdx]) * sz, HostMem::kAlignment);
+                offsets[pgIdx].push_back(total);
+                capacities[pgIdx].push_back(bytes);
+                total += bytes;
+            }
+        }
+        mArena = std::make_unique<HostMem>(total);
+        for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
+        {
+            mPoolGroups.push_back(std::make_unique<HostPoolGroup>(slotCountList[pgIdx],
+                slotDescList[pgIdx].slotSizeList(), *mArena, offsets[pgIdx], capacities[pgIdx]));
+        }
+        TLLM_LOG_INFO("KV cache manager v2 host tier: one %zu-byte pinned arena for %zu pool groups", total,
+            static_cast<size_t>(slotDescList.size().value()));
+        return;
+    }
     // adjust() redistributes a fixed quota between pool groups, so a group can at most take all of it. Reserve
     // address space for that, letting each pool resize in place. Total reservation is numPoolGroups x quota of
     // address space, none of it committed until used.
@@ -686,6 +889,115 @@ HostCacheLevelStorage::HostCacheLevelStorage(
 // ---------------------------------------------------------------------------
 // DiskCacheLevelStorage
 // ---------------------------------------------------------------------------
+
+void HostCacheLevelStorage::destroy()
+{
+    CacheLevelStorage::destroy();
+    if (mArena)
+    {
+        mArena->destroy();
+    }
+}
+
+void HostCacheLevelStorage::relayout(TypedVec<PoolGroupIndex, SlotCount> const& newNumSlots)
+{
+    TLLM_CHECK_WITH_INFO(usesArena(), "HostCacheLevelStorage::relayout: arena mode is off");
+    TLLM_CHECK_WITH_INFO(newNumSlots.size() == mPoolGroups.size(), "relayout: one slot count per pool group");
+    Nvbug6900756Timer const timer("host.relayout");
+    {
+        // Async GPU<->host copies may still read or write the host tier; they must land before slots move.
+        Nvbug6900756Timer const syncTimer("host.ctxSync");
+        cuCheck(cuCtxSynchronize());
+    }
+
+    struct Move
+    {
+        HostSlotPool* pool;
+        size_t oldOffset;
+        size_t newOffset;
+        size_t capacity;
+        size_t liveBytes;
+    };
+
+    std::vector<Move> moves;
+    size_t cursor = 0;
+    for (PoolGroupIndex pgIdx{0}; pgIdx < mPoolGroups.size(); ++pgIdx)
+    {
+        auto& pg = static_cast<HostPoolGroup&>(*mPoolGroups[pgIdx]);
+        // Slot ids at or above the allocator's high-water mark were never handed out, so hold no data.
+        SlotCount const issued = pg.slotAllocator().numActiveSlots();
+        for (PoolIndex poolIdx{0}; poolIdx < pg.numPools(); ++poolIdx)
+        {
+            auto& pool = pg.hostPool(poolIdx);
+            size_t const capacity = roundUp(slotCountToSizeT(newNumSlots[pgIdx]) * pool.slotSize(), HostMem::kAlignment);
+            SlotCount const live = std::min({pool.numSlots(), issued, newNumSlots[pgIdx]});
+            moves.push_back({&pool, pool.arenaOffset(), cursor, capacity, slotCountToSizeT(live) * pool.slotSize()});
+            cursor += capacity;
+        }
+    }
+    TLLM_CHECK_WITH_INFO(cursor <= mArena->size(),
+        "HostCacheLevelStorage::relayout: layout needs %zu bytes but the arena has %zu", cursor, mArena->size());
+
+    int const threads = hostMoveThreads();
+    bool const verify = hostArenaVerify();
+    char* const base = reinterpret_cast<char*>(mArena->address());
+    std::vector<uint64_t> sums(moves.size(), 0);
+    if (verify)
+    {
+        Nvbug6900756Timer const verifyTimer("host.verify");
+        for (size_t i = 0; i < moves.size(); ++i)
+        {
+            sums[i] = checksum(base + moves[i].oldOffset, moves[i].liveBytes, threads);
+        }
+    }
+    size_t movedBytes = 0;
+    // Mutation switch for the prototype test only: repoint pools without moving bytes, which must be caught.
+    bool const skipMove = std::getenv("TLLM_KV_CACHE_MANAGER_V2_HOST_ARENA_TEST_SKIP_MOVE") != nullptr;
+    auto const moveOne = [&](Move const& m)
+    {
+        if (m.newOffset != m.oldOffset && m.liveBytes > 0)
+        {
+            if (!skipMove)
+            {
+                parallelMove(base + m.newOffset, base + m.oldOffset, m.liveBytes, threads);
+            }
+            movedBytes += m.liveBytes;
+        }
+    };
+    {
+        Nvbug6900756Timer const moveTimer("host.move");
+        // Pools keep their order. Moving the left-shifting ones in ascending order and then the right-shifting ones
+        // in descending order never overwrites live data that has not moved yet.
+        for (auto const& m : moves)
+        {
+            if (m.newOffset < m.oldOffset)
+            {
+                moveOne(m);
+            }
+        }
+        for (auto it = moves.rbegin(); it != moves.rend(); ++it)
+        {
+            if (it->newOffset > it->oldOffset)
+            {
+                moveOne(*it);
+            }
+        }
+    }
+    nvbug6900756AddPhase("n.movedGiB", static_cast<double>(movedBytes) / double(size_t{1} << 30));
+    for (auto const& m : moves)
+    {
+        m.pool->setArenaRegion(m.newOffset, m.capacity);
+    }
+    if (verify)
+    {
+        Nvbug6900756Timer const verifyTimer("host.verify");
+        for (size_t i = 0; i < moves.size(); ++i)
+        {
+            TLLM_CHECK_WITH_INFO(checksum(base + moves[i].newOffset, moves[i].liveBytes, threads) == sums[i],
+                "HostCacheLevelStorage::relayout: data of pool %zu changed while moving", i);
+        }
+    }
+}
 
 DiskCacheLevelStorage::DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
     TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory)

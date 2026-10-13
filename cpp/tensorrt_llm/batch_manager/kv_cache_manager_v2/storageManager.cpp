@@ -1871,6 +1871,13 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
             pages = (*persistentPages)[pgIdx];
         shrinkPoolGroup(level, pgIdx, newNumSlots[pgIdx], pages);
     }
+    // A tier-wide host arena keeps its total size; pools only change regions, so move the live slots now that the
+    // shrinking pools have compacted below their new size.
+    if (auto* hostStorage = dynamic_cast<HostCacheLevelStorage*>(&lvlStorage);
+        hostStorage != nullptr && hostStorage->usesArena())
+    {
+        hostStorage->relayout(newNumSlots);
+    }
     // Then expand.
     for (PoolGroupIndex pgIdx{0}; pgIdx < newNumSlots.size(); ++pgIdx)
     {

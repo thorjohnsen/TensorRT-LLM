@@ -272,6 +272,9 @@ class HostSlotPool : public SlotPoolBase
 public:
     //! maxNumSlots > 0 reserves address space for that many slots so resizes pin only the changed range.
     HostSlotPool(size_t slotSize, SlotCount numSlots, SlotCount maxNumSlots = 0);
+    //! Arena mode: the pool is the region [offset, offset + capacityBytes) of a tier-wide buffer owned by
+    //! HostCacheLevelStorage. resize() then only changes the slot count; the owner moves data between regions.
+    HostSlotPool(size_t slotSize, HostMem const& arena, size_t offset, size_t capacityBytes, SlotCount numSlots);
 
     SlotCount numSlots() const noexcept override;
     void destroy() override;
@@ -282,11 +285,28 @@ public:
 
     [[nodiscard]] HostMem const* hostMem() const noexcept
     {
-        return &mHostMem;
+        return mArena != nullptr ? mArena : &mHostMem;
     }
+
+    [[nodiscard]] bool inArena() const noexcept
+    {
+        return mArena != nullptr;
+    }
+
+    [[nodiscard]] size_t arenaOffset() const noexcept
+    {
+        return mArenaOffset;
+    }
+
+    //! Arena mode only: point the pool at a new region. The caller has already moved the live slots there.
+    void setArenaRegion(size_t offset, size_t capacityBytes);
 
 private:
     HostMem mHostMem;
+    HostMem const* mArena = nullptr;
+    size_t mArenaOffset = 0;
+    size_t mArenaCapacity = 0;
+    SlotCount mArenaNumSlots{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -403,8 +423,16 @@ class HostPoolGroup : public PoolGroupBase
 {
 public:
     HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, SlotCount maxNumSlots = 0);
+    //! Arena mode: pools are consecutive regions of arena starting at offsets[i] with capacities[i] bytes.
+    HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, HostMem const& arena,
+        std::vector<size_t> const& offsets, std::vector<size_t> const& capacities);
 
     [[nodiscard]] HostMem const* hostMem(PoolIndex poolIndex) const;
+
+    [[nodiscard]] HostSlotPool& hostPool(PoolIndex poolIndex)
+    {
+        return static_cast<HostSlotPool&>(*mPools.at(poolIndex));
+    }
 };
 
 class DiskPoolGroup : public PoolGroupBase
@@ -588,6 +616,22 @@ public:
     {
         return HostMem::kAlignment;
     }
+
+    void destroy() override;
+
+    //! Whether all pools live in one tier-wide pinned buffer (TLLM_KV_CACHE_MANAGER_V2_HOST_ARENA=1).
+    [[nodiscard]] bool usesArena() const noexcept
+    {
+        return mArena != nullptr;
+    }
+
+    //! Arena mode: lay the pools out contiguously for newNumSlots and move each pool's live slots to its new
+    //! region. Call after shrinking (live slots of a shrinking pool already sit below its new size) and before
+    //! expanding. No pinning or unpinning happens; the buffer stays registered for its whole lifetime.
+    void relayout(TypedVec<PoolGroupIndex, SlotCount> const& newNumSlots);
+
+private:
+    std::unique_ptr<HostMem> mArena;
 };
 
 class DiskCacheLevelStorage : public CacheLevelStorage
