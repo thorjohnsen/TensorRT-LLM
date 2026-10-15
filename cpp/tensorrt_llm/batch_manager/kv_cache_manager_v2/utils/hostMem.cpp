@@ -432,6 +432,7 @@ void HostMem::commitRange(size_t begin, size_t end)
     {
         return;
     }
+    Nvbug6900756Timer const timer("host.commit");
     void* addr = reinterpret_cast<void*>(mAddr + begin);
     if (::mprotect(addr, end - begin, PROT_READ | PROT_WRITE) != 0)
     {
@@ -455,6 +456,7 @@ void HostMem::releaseRange(size_t begin, size_t end) noexcept
     {
         return;
     }
+    Nvbug6900756Timer const timer("host.release");
     // Replacing the range with a fresh PROT_NONE mapping frees its pages and keeps the address space reserved.
     void* ptr = ::mmap(reinterpret_cast<void*>(mAddr + begin), end - begin, PROT_NONE,
         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
@@ -476,6 +478,7 @@ void HostMem::registerRange(size_t begin, size_t end)
         {
             next = alignedEnd; // keep the unaligned tail as its own small extent
         }
+        Nvbug6900756Timer const timer("host.register");
         CUresult const res = cuMemHostRegister(reinterpret_cast<void*>(mAddr + cur), next - cur,
             CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP);
         cuCheck(res);
@@ -492,7 +495,10 @@ void HostMem::unregisterAfter(size_t offset)
     while (!mExtents.empty() && mExtents.back().second > offset)
     {
         auto const [b, e] = mExtents.back();
-        cuCheck(cuMemHostUnregister(reinterpret_cast<void*>(mAddr + b)));
+        {
+            Nvbug6900756Timer const timer("host.unregister");
+            cuCheck(cuMemHostUnregister(reinterpret_cast<void*>(mAddr + b)));
+        }
         mExtents.pop_back();
         if (b < offset)
         {
