@@ -26,12 +26,15 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <cuda.h>
 #include <map>
 #include <numaif.h>
 #include <string>
 #include <sys/mman.h>
+#include <thread>
 #include <unistd.h>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -39,6 +42,19 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
 namespace
 {
+
+//! nvbug6900756 experiment: pause after each VMM granule the fill worker
+//! commits, in microseconds. TLLM_NVBUG6900756_FILL_SLEEP_US overrides the
+//! 50 ms default; 0 disables the pause.
+long fillSleepUs()
+{
+    static long const value = []
+    {
+        char const* env = std::getenv("TLLM_NVBUG6900756_FILL_SLEEP_US");
+        return env != nullptr ? std::strtol(env, nullptr, 10) : 50000L;
+    }();
+    return value;
+}
 
 //! Minimum granularity madvise accepts. The fill worker commits in much larger
 //! chunks; this is only the alignment floor.
@@ -275,6 +291,12 @@ public:
             for (; committed < size; committed += mGranularity)
             {
                 commitOne(offset + committed);
+                // nvbug6900756 experiment: give other threads of this process a
+                // window on the driver lock between granules (fill thread only).
+                if (fillSleepUs() > 0)
+                {
+                    std::this_thread::sleep_for(std::chrono::microseconds(fillSleepUs()));
+                }
             }
             // Inside the try: a failure here would otherwise leave every granule
             // above mapped until destroy(), and the caller treats a failed
