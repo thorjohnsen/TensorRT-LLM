@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <cuda.h>
@@ -41,6 +42,17 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
 namespace
 {
+
+std::atomic<size_t> gHostCopySplitBytes{0};
+
+void noteRegisteredUnitSize(size_t unit) noexcept
+{
+    size_t current = gHostCopySplitBytes.load(std::memory_order_relaxed);
+    while ((current == 0 || unit < current)
+        && !gHostCopySplitBytes.compare_exchange_weak(current, unit, std::memory_order_relaxed))
+    {
+    }
+}
 
 //! Minimum granularity madvise accepts. The fill worker commits in much larger
 //! chunks; this is only the alignment floor.
@@ -146,6 +158,10 @@ public:
         , mAllowRemoteNumaFallback(options.allowRemoteNumaFallback)
         , mRegisterUnits(registerUnits)
     {
+        if (mRegisterUnits)
+        {
+            noteRegisteredUnitSize(mAlignment);
+        }
     }
 
     ~MmapHostMemBacking() override
@@ -482,6 +498,11 @@ private:
 };
 
 } // namespace
+
+size_t hostCopySplitBytes() noexcept
+{
+    return gHostCopySplitBytes.load(std::memory_order_relaxed);
+}
 
 HostMemBackingKind selectHostMemBackingKind()
 {

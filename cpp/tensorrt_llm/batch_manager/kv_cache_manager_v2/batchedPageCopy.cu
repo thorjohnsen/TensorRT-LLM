@@ -18,6 +18,7 @@
 #include "batchedPageCopy.h"
 
 #include "utils/hostMem.h"
+#include "utils/hostMemBacking.h"
 
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -892,15 +893,46 @@ void BatchedPageCopier::launchCopyEngine(PoolCopyArgs const& args, CUstream stre
     thread_local std::vector<CUdeviceptr> copyEngineSrcs;
     thread_local std::vector<size_t> copyEngineSizes;
 
-    copyEngineDsts.resize(args.numPairs);
-    copyEngineSrcs.resize(args.numPairs);
-    copyEngineSizes.assign(args.numPairs, args.bytesPerPage);
-    for (uint32_t slot = 0; slot < args.numPairs; ++slot)
+    size_t const splitBytes = hostCopySplitBytes();
+    if (splitBytes == 0)
     {
-        PageIndexPair const pair = args.pairs[slot]; // host memory; see pageIndexLocation()
-        TLLM_CHECK_DEBUG(pair.dst >= 0 && pair.src >= 0);
-        copyEngineDsts[slot] = args.dstBase + static_cast<uint64_t>(pair.dst) * args.dstStride;
-        copyEngineSrcs[slot] = args.srcBase + static_cast<uint64_t>(pair.src) * args.srcStride;
+        copyEngineDsts.resize(args.numPairs);
+        copyEngineSrcs.resize(args.numPairs);
+        copyEngineSizes.assign(args.numPairs, args.bytesPerPage);
+        for (uint32_t slot = 0; slot < args.numPairs; ++slot)
+        {
+            PageIndexPair const pair = args.pairs[slot]; // host memory; see pageIndexLocation()
+            TLLM_CHECK_DEBUG(pair.dst >= 0 && pair.src >= 0);
+            copyEngineDsts[slot] = args.dstBase + static_cast<uint64_t>(pair.dst) * args.dstStride;
+            copyEngineSrcs[slot] = args.srcBase + static_cast<uint64_t>(pair.src) * args.srcStride;
+        }
+    }
+    else
+    {
+        // Each piece must stay inside one registered host unit; cutting at splitBytes-aligned
+        // addresses on both sides guarantees that for every unit size in use.
+        copyEngineDsts.clear();
+        copyEngineSrcs.clear();
+        copyEngineSizes.clear();
+        for (uint32_t slot = 0; slot < args.numPairs; ++slot)
+        {
+            PageIndexPair const pair = args.pairs[slot];
+            TLLM_CHECK_DEBUG(pair.dst >= 0 && pair.src >= 0);
+            CUdeviceptr dst = args.dstBase + static_cast<uint64_t>(pair.dst) * args.dstStride;
+            CUdeviceptr src = args.srcBase + static_cast<uint64_t>(pair.src) * args.srcStride;
+            size_t remaining = args.bytesPerPage;
+            while (remaining > 0)
+            {
+                size_t const piece = std::min(
+                    {remaining, splitBytes - static_cast<size_t>(dst % splitBytes), splitBytes - static_cast<size_t>(src % splitBytes)});
+                copyEngineDsts.push_back(dst);
+                copyEngineSrcs.push_back(src);
+                copyEngineSizes.push_back(piece);
+                dst += piece;
+                src += piece;
+                remaining -= piece;
+            }
+        }
     }
     // Stream-ordered source access is what keeps this asynchronous when the host side is
     // unregistered memory, which is what the mmap host backing provides. A plain cuMemcpyAsync
@@ -911,7 +943,7 @@ void BatchedPageCopier::launchCopyEngine(PoolCopyArgs const& args, CUstream stre
     attributes.flags = CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE;
     size_t firstCopy = 0;
     TLLM_CU_CHECK(cuMemcpyBatchAsync(copyEngineDsts.data(), copyEngineSrcs.data(), copyEngineSizes.data(),
-        args.numPairs, &attributes, &firstCopy, 1, stream));
+        copyEngineSizes.size(), &attributes, &firstCopy, 1, stream));
 }
 
 void BatchedPageCopier::launchKernel(PoolCopyArgs const& args, CopyDirection direction, CUstream stream) const

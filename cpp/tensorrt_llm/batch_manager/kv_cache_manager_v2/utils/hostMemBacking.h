@@ -145,6 +145,12 @@ struct HostMemBackingOptions
 //! rather than going through this.
 [[nodiscard]] HostMemBackingKind selectHostMemBackingKind();
 
+//! nvbug6900756 experiment: when the register backing is active, host ranges are page-locked in
+//! separately registered units, and a copy whose host range crosses a unit boundary is rejected by
+//! cuMemcpyBatchAsync. Returns the smallest unit size in use (units are aligned to their size and
+//! are power-of-two multiples of each other), or 0 when no copy needs splitting.
+[[nodiscard]] size_t hostCopySplitBytes() noexcept;
+
 //! `options.commitUnit` becomes the backing's commitGranularity(), rounded up
 //! to whatever the platform requires. Larger units make the fill cheaper and a
 //! resize coarser.
