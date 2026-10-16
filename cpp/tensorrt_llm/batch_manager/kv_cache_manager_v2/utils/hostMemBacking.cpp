@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <cuda.h>
 #include <map>
@@ -33,6 +34,7 @@
 #include <string>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -136,9 +138,13 @@ void bindRangeToGpuNumaNode(MemAddress addr, size_t size, bool allowRemoteFallba
 class MmapHostMemBacking final : public IHostMemBacking
 {
 public:
-    explicit MmapHostMemBacking(HostMemBackingOptions const& options)
+    //! With `registerUnits`, every commit unit is page-locked with cuMemHostRegister after it is
+    //! populated, so a GPU without ATS can DMA it. Populating happens outside the driver; only the
+    //! registration of one unit at a time holds driver locks.
+    explicit MmapHostMemBacking(HostMemBackingOptions const& options, bool registerUnits = false)
         : mAlignment(std::max(options.commitUnit, commitAlignment()))
         , mAllowRemoteNumaFallback(options.allowRemoteNumaFallback)
+        , mRegisterUnits(registerUnits)
     {
     }
 
@@ -159,13 +165,57 @@ public:
         //! change VMA flags and split the mapping into one VMA per chunk.
         hostMadvisePageMode(mAddr, mSize, hostUseThp());
         bindRangeToGpuNumaNode(mAddr, mSize, mAllowRemoteNumaFallback);
+        if (mRegisterUnits)
+        {
+            mRegistered.assign((mSize + mAlignment - 1) / mAlignment, false);
+            // Registration needs a current context; the fill worker that commits may not have one.
+            cuCheck(cuCtxGetCurrent(&mContext));
+            TLLM_CHECK_WITH_INFO(mContext != nullptr, "HostMem register backing reserved without a CUDA context");
+        }
         return mAddr;
     }
 
     void commit(size_t offset, size_t size) override
     {
         TLLM_CHECK_DEBUG(mAddr != 0 && offset + size <= mSize);
-        hostPrefaultChunk(mAddr + offset, size);
+        if (!mRegisterUnits)
+        {
+            hostPrefaultChunk(mAddr + offset, size);
+            return;
+        }
+        TLLM_CHECK_DEBUG(offset % mAlignment == 0);
+        CUcontext current = nullptr;
+        cuCheck(cuCtxGetCurrent(&current));
+        if (current != mContext)
+        {
+            cuCheck(cuCtxSetCurrent(mContext));
+        }
+        size_t done = 0;
+        try
+        {
+            while (done < size)
+            {
+                size_t const unit = std::min(mAlignment, size - done);
+                void* const ptr = reinterpret_cast<void*>(mAddr + offset + done);
+                hostPrefaultChunk(mAddr + offset + done, unit);
+                CUresult const registered
+                    = cuMemHostRegister(ptr, unit, CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP);
+                if (registered == CUDA_ERROR_OUT_OF_MEMORY)
+                {
+                    ::madvise(ptr, unit, MADV_DONTNEED);
+                    throw HostOOMError("cuMemHostRegister failed: out of memory");
+                }
+                cuCheck(registered);
+                mRegistered[(offset + done) / mAlignment] = true;
+                done += unit;
+            }
+        }
+        catch (...)
+        {
+            // The caller treats a failed commit as having taken nothing.
+            decommit(offset, done);
+            throw;
+        }
     }
 
     void decommit(size_t offset, size_t size) noexcept override
@@ -175,6 +225,7 @@ public:
             return;
         }
         TLLM_CHECK_DEBUG(offset + size <= mSize);
+        unregisterUnits(offset, size);
         //! MADV_DONTNEED drops the pages without changing VMA flags, so unlike
         //! mprotect it does not split the mapping.
         ::madvise(reinterpret_cast<void*>(mAddr + offset), size, MADV_DONTNEED);
@@ -190,7 +241,12 @@ public:
         // that let this range's CUDA consumers finish, and unmapping under one corrupts whatever is
         // mapped there next. The range is kept instead, which costs a tier in a process whose cache
         // is already permanently unusable.
-        KVCM2_POISON_ON_EXCEPT([&] { hostMunmap(mAddr, mSize); });
+        KVCM2_POISON_ON_EXCEPT(
+            [&]
+            {
+                unregisterUnits(0, mSize);
+                hostMunmap(mAddr, mSize);
+            });
         mAddr = 0;
         mSize = 0;
     }
@@ -202,14 +258,39 @@ public:
 
     [[nodiscard]] char const* name() const noexcept override
     {
-        return "mmap";
+        return mRegisterUnits ? "mmap+register" : "mmap";
     }
 
 private:
+    //! Unregisters every registered unit that starts inside [offset, offset + size).
+    void unregisterUnits(size_t offset, size_t size) noexcept
+    {
+        if (!mRegisterUnits)
+        {
+            return;
+        }
+        for (size_t unit = offset / mAlignment; unit < mRegistered.size() && unit * mAlignment < offset + size; ++unit)
+        {
+            if (!mRegistered[unit])
+            {
+                continue;
+            }
+            CUresult const result = cuMemHostUnregister(reinterpret_cast<void*>(mAddr + unit * mAlignment));
+            if (result != CUDA_SUCCESS)
+            {
+                TLLM_LOG_WARNING("cuMemHostUnregister failed (%d) for host unit %zu", static_cast<int>(result), unit);
+            }
+            mRegistered[unit] = false;
+        }
+    }
+
     MemAddress mAddr = 0;
     size_t mSize = 0;
     size_t const mAlignment;
     bool const mAllowRemoteNumaFallback;
+    bool const mRegisterUnits;
+    CUcontext mContext = nullptr;
+    std::vector<bool> mRegistered;
 };
 
 // ---------------------------------------------------------------------------
@@ -441,6 +522,20 @@ std::unique_ptr<IHostMemBacking> createHostMemBacking(HostMemBackingKind kind, H
 
 std::unique_ptr<IHostMemBacking> createHostMemBacking(HostMemBackingOptions const& options)
 {
+    // nvbug6900756 experiment: TLLM_NVBUG6900756_HOST_BACKING=register replaces the VMM backing with
+    // mmap + populate + cuMemHostRegister per commit unit.
+    char const* forced = std::getenv("TLLM_NVBUG6900756_HOST_BACKING");
+    if (forced != nullptr && std::string(forced) == "register"
+        && selectHostMemBackingKind() == HostMemBackingKind::kVmm)
+    {
+        static bool const logged = []
+        {
+            TLLM_LOG_INFO("KVCM2 host memory backing: mmap+register (nvbug6900756 experiment)");
+            return true;
+        }();
+        (void) logged;
+        return std::make_unique<MmapHostMemBacking>(options, /*registerUnits=*/true);
+    }
     return createHostMemBacking(selectHostMemBackingKind(), options);
 }
 
